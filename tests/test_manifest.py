@@ -32,7 +32,7 @@ def _write(tmp_path, **overrides):
         ],
         detail="balanced",
         quality="1080",
-        resolution=1536,
+        resolution=1344,
         resolution_source="screen-recording",
         screen_evidence={"reason": "6/6 frames", "flat_tiles": 7},
         effective_start=0.0,
@@ -63,7 +63,7 @@ def test_every_frame_carries_a_timestamp_and_reason(tmp_path):
 def test_manifest_records_how_the_frames_were_made(tmp_path):
     """Enough to reproduce or to explain the run later, without the stdout."""
     _, data = _write(tmp_path)
-    assert data["frame_width"] == 1536
+    assert data["frame_width"] == 1344
     assert data["frame_width_source"] == "screen-recording"
     assert data["screen_recording"]["flat_tiles"] == 7
     assert data["download_quality_ceiling"] == "1080"

@@ -163,3 +163,54 @@ def test_screen_resolution_is_within_read_limit():
 def test_tile_threshold_sits_between_the_measured_groups():
     """Measured medians: screen recordings 4-7 flat tiles, camera footage 0-1."""
     assert 1 < frames.SCREEN_MIN_FLAT_TILES < 4
+
+
+# ---- image token cost ------------------------------------------------------
+#
+# Claude bills images by 28x28-pixel patches: ceil(w/28) * ceil(h/28) visual
+# tokens, and nothing else — file size and JPEG quality are irrelevant. These
+# guard the widths against a well-meaning "round number" edit, and against the
+# earlier claim (now corrected) that screen-recording mode was break-even.
+
+import math  # noqa: E402
+
+
+def _tokens(width: int, height: int) -> int:
+    return math.ceil(width / frames.PATCH) * math.ceil(height / frames.PATCH)
+
+
+def _height_16x9(width: int) -> int:
+    h = round(width * 9 / 16)
+    return h - (h % 2)  # ffmpeg force_divisible_by=2
+
+
+def test_screen_width_lands_exactly_on_the_patch_grid():
+    """1344x756 is 48x27 patches with nothing wasted. A width that is not a
+    multiple of 28 pays for a column of near-empty patches: 1536 costs 1705
+    tokens for the same legibility, 24% more."""
+    w = frames.SCREEN_RESOLUTION
+    h = _height_16x9(w)
+    assert w % frames.PATCH == 0, f"{w} is not a multiple of {frames.PATCH}"
+    assert h % frames.PATCH == 0, f"16:9 height {h} is not a multiple of {frames.PATCH}"
+    assert _tokens(w, h) == 1296
+
+
+def test_screen_mode_is_dearer_not_break_even():
+    """Documents the real ratio. SKILL.md used to claim the lower cap held the
+    bill steady; it does not, and the cap is a ceiling rather than compensation."""
+    screen = frames.SCREEN_FRAME_CAP * _tokens(
+        frames.SCREEN_RESOLUTION, _height_16x9(frames.SCREEN_RESOLUTION)
+    )
+    full_default = 100 * _tokens(
+        frames.DEFAULT_RESOLUTION, _height_16x9(frames.DEFAULT_RESOLUTION)
+    )
+    assert screen > full_default * 2
+
+
+def test_frame_height_stays_under_the_many_image_limit():
+    """Above 20 images in a request, every image must stay under 2000px on both
+    edges or the request is rejected outright — not downscaled. A frames-only
+    run passes 20 images almost immediately."""
+    assert frames.MAX_READ_DIMENSION < 2000
+    assert _height_16x9(frames.SCREEN_RESOLUTION) < 2000
+    assert frames.SCREEN_RESOLUTION < 2000

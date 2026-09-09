@@ -148,7 +148,7 @@ Optional flags:
 - `--start T` / `--end T` — focus on a section. Accepts `SS`, `MM:SS`, or `HH:MM:SS`. When either is set, fps auto-scales denser (see "Focusing on a section" below).
 - `--timestamps T1,T2,…` — grab a frame at each of these absolute timestamps (`SS`, `MM:SS`, or `HH:MM:SS`). Use this after reading the transcript to capture deictic moments the presenter flags ("look here", "as you can see", "notice this") that visual selection alone may miss. See "Transcript-cue frames" below.
 - `--max-frames N` — override the preset cap for tighter token budget (e.g. `--max-frames 40`)
-- `--resolution W` — frame width in px. Default is **automatic**: 512 for ordinary footage, 1536 when the source is measured to be a screen recording (see "Screen recordings" below). Pass this only to override that decision — e.g. `--resolution 512` to force the cheap width on a tutorial you only need the gist of, or `--resolution 1998` (the ceiling) for exceptionally small text.
+- `--resolution W` — frame width in px. Default is **automatic**: 512 for ordinary footage, 1344 when the source is measured to be a screen recording (see "Screen recordings" below). Pass this only to override that decision — e.g. `--resolution 512` to force the cheap width on a tutorial you only need the gist of, or `--resolution 1792` for exceptionally small text (also an exact patch multiple, 2304 tokens/frame). Never go above 1998 — see Token efficiency.
 - `--quality H` — max download height: `360`, `480`, `720`, `1080` (default), `1440`, `2160`, or `best`. Set a persistent default with `WATCH_QUALITY` in `~/.config/watch/.env`. Lower it on a slow connection; raise it when the user needs to read dense on-screen text. A ceiling is a preference, not a requirement — a video that only exists above it still downloads.
 - `--fps F` — override auto-fps (clamped to 2 fps max)
 - `--out-dir DIR` — keep working files somewhere specific (default: an auto-generated tmp dir)
@@ -160,7 +160,7 @@ Optional flags:
 
 Software tutorials, coding walkthroughs, slide decks and UI demos carry their payload as small on-screen text. At the ordinary 512px frame width that text is destroyed — menu items in a 1920-wide capture land about three pixels tall — and a better download does **not** fix it, because the loss happens at frame extraction, not at download.
 
-So the script measures the source before extracting. It samples six frames, splits each into a 3×3 grid, and asks two questions per frame: how many tiles are *flat* (nearly all pixels at one luma value — UI chrome and background), and whether the frame carries any fine *detail* at all. A frame counts as screen-like with 3+ flat tiles and detail above the floor; a majority of screen-like frames makes it a screen recording. Then the frame width goes to 1536 and the frame cap drops to 40, holding the token cost roughly steady.
+So the script measures the source before extracting. It samples six frames, splits each into a 3×3 grid, and asks two questions per frame: how many tiles are *flat* (nearly all pixels at one luma value — UI chrome and background), and whether the frame carries any fine *detail* at all. A frame counts as screen-like with 3+ flat tiles and detail above the floor; a majority of screen-like frames makes it a screen recording. Then the frame width goes to 1344 and the frame cap drops to 40. That is a ceiling on an expensive mode, not a break-even — see Token efficiency for what it actually costs.
 
 Measured across real 1080p uploads: screen recordings show 4-7 flat tiles of 9, camera footage 0-1.
 
@@ -175,7 +175,7 @@ What this means for you:
 - **Mention it when it fires.** The stderr line and the report's **Frame size** line both name the measured flatness. "This is a screen recording, so I pulled fewer frames at higher resolution" is useful context for the user.
 - **Long tutorials still want `--start`/`--end`.** A 90-minute masterclass at 40 frames is one frame every two minutes. Read the transcript first, find the section the user cares about, then re-run focused on it — that is what buys the budget for detail.
 - **`--timestamps` pairs well with it.** After reading the transcript, grab the exact moments where the presenter says "click here" / "as you can see".
-- **If text is still too small**, re-run with `--resolution 1998` (the ceiling) on a tight range.
+- **If text is still too small**, re-run with `--resolution 1792` on a tight range. Do not exceed 1998: above 2000px a multi-frame request is rejected outright rather than downscaled.
 - **If it misfires**, pass `--resolution 512` to force the cheap width back. The report's **Frame size** line shows the tile count and detail that drove the decision, so you can say why it fired.
 
 ### Focusing on a section (higher frame rate)
@@ -229,7 +229,7 @@ At `transcript` detail, captions are enough to return a report without downloadi
 
 At `efficient` detail, the script downloads the video and extracts **keyframes only** (`ffmpeg -skip_frame nokey`) — a near-instant pass that lands frames on scene cuts. If a clip has fewer than 4 keyframes it falls back to uniform sampling.
 
-At `balanced` / `token-burner` detail, the script extracts **scene-aware** frames: ffmpeg scene-change selection first, falling back to uniform sampling only when the video is effectively static. `balanced` caps at 100 frames; `token-burner` is uncapped. Frame report lines include both timestamp and selection reason. Extracted images are clamped to a maximum 1998px height for Claude Read compatibility.
+At `balanced` / `token-burner` detail, the script extracts **scene-aware** frames: ffmpeg scene-change selection first, falling back to uniform sampling only when the video is effectively static. `balanced` caps at 100 frames; `token-burner` is uncapped. Frame report lines include both timestamp and selection reason. Extracted images are clamped to a maximum 1998px height — above 2000px, a request carrying more than 20 images is rejected outright (see Token efficiency).
 
 ## Transcript-cue frames
 
@@ -267,13 +267,28 @@ Both keys live in `~/.config/watch/.env`. The script prefers Groq when both are 
 
 ## Token efficiency
 
-This skill burns tokens primarily on frames. Order of magnitude:
-- 80 frames at 512px wide is roughly 50-80k image tokens depending on aspect ratio.
-- The transcript is cheap (a few thousand tokens at most for a 10-minute video).
-- Image tokens scale with pixel count, so width costs quadratically: 1024px is ~4x a 512px frame, 1536px ~9x.
-- A detected screen recording therefore lowers the frame cap to 40 as it raises the width, keeping the total bill close to where it was. If the user needs both the readability and the coverage, pass `--max-frames` explicitly — it overrides the reduction.
+This skill burns tokens primarily on frames.
 
-If you already watched a video this session and the user asks a follow-up, do **not** re-run the script — you already have the frames and transcript in context. Just answer from what you have.
+**The cost of a frame is exactly `ceil(width / 28) * ceil(height / 28)`.** Claude sees images as 28×28-pixel patches, and that formula is the whole story — a partial patch costs a full one, and nothing else is a factor. In particular, **JPEG quality and file size do not affect token cost at all**; compressing harder only speeds the upload. Do not suggest re-encoding frames to save budget.
+
+At 16:9, per frame:
+
+| Frame width | Actual size | Patches | Tokens |
+|---|---|---|---|
+| 512 (default) | 512×288 | 19 × 11 | 209 |
+| 1024 | 1024×576 | 37 × 21 | 777 |
+| 1344 (screen recordings) | 1344×756 | 48 × 27 | **1296** |
+| 1536 | 1536×864 | 55 × 31 | 1705 |
+| 1920 | 1920×1080 | 69 × 39 | 2691 |
+
+- A 100-frame run at 512px is about **21k** image tokens; 80 frames about **17k**.
+- The transcript is cheap — a few thousand tokens at most for a 10-minute video.
+- **Screen-recording mode is genuinely expensive, not break-even.** 40 frames at 1344px is ~52k tokens, about 2.5× a full 100-frame 512px run. The lower cap is a ceiling on an expensive mode, not compensation for it. If the user needs both readability and coverage, pass `--max-frames` explicitly — it overrides the reduction — but tell them what it costs.
+- 1344 is chosen because it is the 16:9 width that lands on the patch grid exactly. 1536 is 24% dearer for the same legibility, purely because both of its dimensions spill into a partial patch.
+
+**Hard constraint above 20 images:** when a single request carries more than 20 images, a stricter per-image dimension limit applies to *every* image in it, and oversized ones are rejected outright with an `invalid_request_error` mentioning "many-image requests" — not downscaled. Keeping every edge under 2000px is the documented way to stay safe, which is why the pipeline caps frame height at 1998. Resent conversation history and images inside tool results count toward the 20, so a second `/watch` run in the same conversation is still subject to it. Never raise a frame dimension above 1998 to "get more detail": it fails the whole request rather than costing more.
+
+If you already watched a video this session and the user asks a follow-up, do **not** re-run the script — you already have the frames and transcript in context. Just answer from what you have. This also matters for the limit above: every re-run adds its frames to a request that already carries the old ones.
 
 ## Security & Permissions
 

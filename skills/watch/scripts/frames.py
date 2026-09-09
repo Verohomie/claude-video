@@ -28,6 +28,14 @@ SCENE_MIN_FRAMES = 8
 # Below this many decoded keyframes a clip is too sparse for keyframe coverage
 # (very short or oddly encoded), so the cheap tier falls back to uniform.
 KEYFRAME_MIN = 4
+# Hard ceiling on frame height, and the reason it is just under 2000 rather than
+# a round number: once a single request carries more than 20 images, a stricter
+# per-image dimension limit applies to EVERY image in it, and anything over is
+# rejected with an invalid_request_error mentioning "many-image requests".
+# Staying under 2000px on both edges is the documented way to be safe. A
+# frames-only run passes 20 images almost immediately, and resent conversation
+# history counts too, so this is not a limit to relax — a wider frame would fail
+# the whole request, not just cost more.
 MAX_READ_DIMENSION = 1998
 # Frame-delta dedup: downscale each frame to a DEDUP_THUMB x DEDUP_THUMB
 # grayscale thumbnail and treat two frames as near-identical when their mean
@@ -39,18 +47,35 @@ DEDUP_THUMB = 16
 DEDUP_THRESHOLD = 2.0
 SHOWINFO_TS_RE = re.compile(r"pts_time:([0-9.]+)")
 
-# Frame width used when the caller doesn't pick one and the source is not a
-# screen recording. Cheap, and plenty for "what happens in this video".
+# Claude bills images by 28x28-pixel patches: a frame costs
+# ceil(width/28) * ceil(height/28) visual tokens, and nothing else enters into
+# it. Two consequences drive the widths below.
+#
+# 1. A partial patch costs a whole one, so a width that is not a multiple of 28
+#    pays for a column of mostly-empty patches. Both dimensions land exactly
+#    when a 16:9 frame is 448*k wide (height 252*k).
+# 2. JPEG quality is irrelevant to cost. Compression only affects upload
+#    latency; re-encoding smaller saves nothing on tokens.
+PATCH = 28
+
+# Frame width when the caller doesn't pick one and the source is not a screen
+# recording. Cheap, and plenty for "what happens in this video".
+# 512x288 = 19x11 patches = 209 tokens.
 DEFAULT_RESOLUTION = 512
 # Frame width for a detected screen recording. A 1920-wide UI squeezed to 512
 # renders menu text about three pixels tall — unreadable no matter how good the
-# download was. 1536 is comfortably inside MAX_READ_DIMENSION and, measured on a
-# Google Cloud console capture, is where menu items and small body text become
-# legible. Going higher buys little and costs tokens quadratically.
-SCREEN_RESOLUTION = 1536
-# A 1536px frame carries ~9x the pixels of a 512px one, so the frame cap comes
-# down with it to keep the image-token bill roughly where it was. Only applied
-# when the user did not set --max-frames themselves.
+# download was. 1344x756 is exactly 48x27 patches = 1296 tokens, where menu
+# items, small body text and source code are all legible (measured on a Google
+# Cloud console capture and a VS Code recording). It is the 16:9 width that
+# fits the patch grid exactly: 1536 costs 55x31 = 1705 tokens for the same
+# readability, 24% more, because 1536 and 864 each spill into a partial patch.
+SCREEN_RESOLUTION = 1344
+# Frame cap for a screen recording, applied only when the user did not set
+# --max-frames. This does NOT hold the token bill steady — a 1344px frame costs
+# 1296 tokens against 209 at 512, so 40 frames is ~6x a 40-frame 512px run and
+# ~2.5x a full 100-frame one. It is a deliberate ceiling on an expensive mode,
+# not a break-even: the frames are worth more, and fewer of them keeps a long
+# tutorial from dominating the context outright.
 SCREEN_FRAME_CAP = 40
 # Below this the source has no detail to preserve — _scale_filter never upscales
 # (it takes min(resolution, iw)), so raising the width would change nothing.
