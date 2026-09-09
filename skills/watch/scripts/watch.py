@@ -7,6 +7,7 @@ then Reads each frame path to see the video.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -20,6 +21,75 @@ from download import download, fetch_captions, is_url  # noqa: E402
 from frames import DEFAULT_RESOLUTION, MAX_FPS, SCREEN_FRAME_CAP, SCREEN_RESOLUTION, auto_fps, auto_fps_focus, detect_screen_recording, extract_at_timestamps, extract_keyframes, extract_scene_or_uniform, format_time, get_metadata, merge_frames, parse_time, parse_timestamps  # noqa: E402
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 from whisper import load_api_key, transcribe_video  # noqa: E402
+
+
+def write_manifest(
+    work: Path,
+    *,
+    source: str,
+    info: dict,
+    meta: dict,
+    frames: list[dict],
+    detail: str,
+    quality: str | None,
+    resolution: int,
+    resolution_source: str,
+    screen_evidence: dict,
+    effective_start: float,
+    effective_end: float,
+    focused: bool,
+    transcript_source: str | None,
+    transcript_segments: list[dict],
+) -> Path | None:
+    """Write frames.json next to the extracted images.
+
+    The frame → timestamp mapping otherwise exists only in the stdout report,
+    which is routinely piped or truncated (it is mostly transcript), leaving a
+    directory of JPEGs with no way to say when any of them happened. That is
+    fine for a summary and useless the moment a frame is cited as evidence.
+
+    Best-effort: a manifest that cannot be written must never fail the run,
+    since every frame and the whole report are already produced.
+    """
+    payload = {
+        "source": source,
+        "title": info.get("title"),
+        "uploader": info.get("uploader"),
+        "duration_seconds": meta.get("duration_seconds"),
+        "video_width": meta.get("width"),
+        "video_height": meta.get("height"),
+        "download_quality_ceiling": quality,
+        "detail": detail,
+        "frame_width": resolution,
+        "frame_width_source": resolution_source,
+        "screen_recording": screen_evidence or None,
+        "range": {
+            "focused": focused,
+            "start_seconds": round(effective_start, 3),
+            "end_seconds": round(effective_end, 3),
+        },
+        "transcript": {
+            "source": transcript_source,
+            "segments": len(transcript_segments),
+        },
+        "frames": [
+            {
+                "file": Path(frame["path"]).name,
+                "path": frame["path"],
+                "timestamp_seconds": frame["timestamp_seconds"],
+                "timestamp": format_time(frame["timestamp_seconds"]),
+                "reason": frame.get("reason", "selected"),
+            }
+            for frame in frames
+        ],
+    }
+    path = work / "frames.json"
+    try:
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except OSError as exc:
+        print(f"[watch] could not write {path}: {exc}", file=sys.stderr)
+        return None
+    return path
 
 
 def main() -> int:
@@ -394,11 +464,31 @@ def main() -> int:
             "`--detail token-burner` to keep every scene-change frame across the whole video."
         )
 
+    manifest_path = write_manifest(
+        work,
+        source=args.source,
+        info=info,
+        meta=meta,
+        frames=frames,
+        detail=detail,
+        quality=quality if dl.get("downloaded") else None,
+        resolution=resolution,
+        resolution_source=resolution_source,
+        screen_evidence=screen_evidence,
+        effective_start=effective_start,
+        effective_end=effective_end,
+        focused=focused,
+        transcript_source=transcript_source,
+        transcript_segments=transcript_segments,
+    )
+
     print()
     print("## Frames")
     print()
     if frames:
         print(f"Frames live at: `{work / 'frames'}`")
+        if manifest_path:
+            print(f"Frame index (filename → timestamp → reason): `{manifest_path}`")
         print()
         print(
             "**Read each frame path below with the Read tool to view the image.** "

@@ -119,7 +119,10 @@ def pinned_probe(monkeypatch):
     installed yt-dlp AND writes its cache into the developer's own
     ~/.config/watch — so the test would be both machine-dependent and dirty.
     """
-    monkeypatch.setattr(setup, "probe_ytdlp", lambda **kw: _probe(
+    # Patch the name in download, not in setup: download.py does
+    # `from setup import probe_ytdlp`, binding its own reference at import,
+    # so patching setup.probe_ytdlp would leave the caller on the real one.
+    monkeypatch.setattr(download, "probe_ytdlp", lambda **kw: _probe(
         version_age_days=67, impersonation=False, path="/opt/homebrew/bin/yt-dlp"
     ))
 
@@ -148,5 +151,5 @@ def test_failure_message_without_a_known_cause_still_helps(tmp_path, pinned_prob
 
 
 def test_state_line_is_silent_when_the_probe_cannot_answer(monkeypatch):
-    monkeypatch.setattr(setup, "probe_ytdlp", lambda **kw: {"path": None, "version": None})
+    monkeypatch.setattr(download, "probe_ytdlp", lambda **kw: {"path": None, "version": None})
     assert download._ytdlp_state_line() is None

@@ -22,6 +22,11 @@ URL = "https://www.youtube.com/watch?v=rlOpbu3Enkw"
 
 
 def _capture_argv(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    # download.py resolves the best yt-dlp before building argv, which shells
+    # out to probe each candidate and caches the result under ~/.config/watch.
+    # Stub it: these tests are about the argv, and must neither record the
+    # probe's own calls nor touch the developer's real config dir.
+    monkeypatch.setattr(download, "resolve_ytdlp", lambda: "yt-dlp")
     calls: list[list[str]] = []
 
     class _Popen:

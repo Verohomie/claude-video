@@ -17,25 +17,27 @@ def _seed_ytdlp_probe(home: Path, *, version=None, impersonation=True) -> None:
     """Pin the cached yt-dlp probe under a temp HOME.
 
     Preflight warns about a stale or impersonation-less yt-dlp, so without this
-    every assertion about setup's output would depend on which yt-dlp the
-    developer happens to have installed. Seeding the cache (keyed on the
-    resolved binary path, exactly as setup.py writes it) makes the tests
-    hermetic; the default is a healthy install, i.e. no warnings.
+    every assertion about setup's output would depend on which yt-dlp copies the
+    developer happens to have installed. The cache is keyed on the exact
+    candidate set, which depends on PATH and on HOME, so the seed is written by
+    setup.py itself under the same environment rather than guessed at here.
     """
-    path = shutil.which("yt-dlp")
-    if path is None:  # nothing to warn about anyway
-        return
-    cfg = home / ".config" / "watch"
-    cfg.mkdir(parents=True, exist_ok=True)
-    (cfg / ".ytdlp-probe.json").write_text(
-        json.dumps({
-            "path": path,
-            "version": version or datetime.now().strftime("%Y.%m.%d"),
-            "impersonation": impersonation,
-            "checked_at": time.time(),
-        }),
-        encoding="utf-8",
-    )
+    version = version or datetime.now().strftime("%Y.%m.%d")
+    snippet = (
+        "import json, sys, time\n"
+        f"sys.path.insert(0, {str(SETUP.parent)!r})\n"
+        "import setup\n"
+        "cands = setup.ytdlp_candidates()\n"
+        "probes = {p: {'path': p, 'version': %r, 'impersonation': %r,\n"
+        "              'checked_at': time.time()} for p in cands}\n"
+        "setup.CONFIG_DIR.mkdir(parents=True, exist_ok=True)\n"
+        "setup.YTDLP_PROBE_CACHE.write_text(\n"
+        "    json.dumps({'checked_at': time.time(), 'probes': probes}), encoding='utf-8')\n"
+    ) % (version, impersonation)
+    env = dict(os.environ)
+    env["HOME"] = str(home)
+    env["USERPROFILE"] = str(home)
+    subprocess.run([sys.executable, "-c", snippet], check=True, env=env, capture_output=True)
 
 
 def _run(args, *, home=None, extra_env=None, seed_probe=True):

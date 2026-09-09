@@ -83,7 +83,9 @@ The installer is idempotent — safe to re-run:
 python3 "${SKILL_DIR}/scripts/setup.py"
 ```
 
-On macOS with Homebrew, it auto-installs `ffmpeg` and `yt-dlp`. On Linux/Windows, it prints the exact install commands for the user to run. It scaffolds `~/.config/watch/.env` with commented placeholders and default watch settings at `0600` perms.
+On macOS it auto-installs `ffmpeg` with Homebrew, and `yt-dlp` with `pipx` (falling back to `pip --user`). yt-dlp deliberately does **not** come from Homebrew: that formula lags weeks behind and is built without `curl_cffi`, so YouTube refuses the video stream from it while captions still work. On Linux/Windows it prints the exact install commands for the user to run. It scaffolds `~/.config/watch/.env` with commented placeholders and default watch settings at `0600` perms.
+
+Because a machine can end up with several copies, the scripts choose the **best** yt-dlp installed — one that can impersonate a browser wins, then the newest — and invoke it by absolute path. `PATH` order does not decide, so a Homebrew copy ahead of a pipx one is harmless.
 
 **If an API key is still missing after install:** use `AskUserQuestion` to ask the user whether they have a Groq API key (preferred — cheaper, faster) or an OpenAI key. Then write it into `~/.config/watch/.env` — set the matching `GROQ_API_KEY=...` or `OPENAI_API_KEY=...` line. If they don't want to set up Whisper, proceed with `--no-whisper` and tell them videos without native captions will come back frames-only.
 
@@ -256,11 +258,11 @@ Both keys live in `~/.config/watch/.env`. The script prefers Groq when both are 
 
 ## Failure modes and handling
 
-- **Setup preflight failed** → run `python3 "${SKILL_DIR}/scripts/setup.py"` (auto-installs ffmpeg/yt-dlp via brew on macOS, scaffolds the `.env`). For API key, ask the user via `AskUserQuestion` and write it to `~/.config/watch/.env`.
+- **Setup preflight failed** → run `python3 "${SKILL_DIR}/scripts/setup.py"` (installs ffmpeg via brew on macOS and yt-dlp via pipx/pip — deliberately not brew, whose build cannot download from YouTube — and scaffolds the `.env`). For API key, ask the user via `AskUserQuestion` and write it to `~/.config/watch/.env`.
 - **No transcript available** → captions missing AND (no Whisper key OR Whisper API failed). Script prints a hint pointing to setup. Proceed frames-only and tell the user.
 - **Long video warning printed** → acknowledge it in your answer. Offer to re-run focused on a specific section via `--start`/`--end` rather than a sparse full-video scan.
 - **Download fails** → the script diagnoses the common causes and prints the fix; relay that message rather than paraphrasing it. If it's a login-required, private, or region-locked video, tell the user plainly and do not keep retrying.
-- **Download refused (403 / "sign in to confirm you're not a bot" / "only images are available")** → almost always an out-of-date yt-dlp, not a problem with the video. yt-dlp is perishable: sites change their defences every few weeks and yt-dlp answers within days, so a copy more than a month old is a likely failure. Homebrew's build is doubly affected — it lags on version *and* omits `curl_cffi`, so its browser-impersonation targets all read "unavailable". Give the user the command the error message prints (`pipx install --force 'yt-dlp[default,curl-cffi]'`) and note that `~/.local/bin` must come before `/opt/homebrew/bin` on `PATH`. Preflight warns about both conditions before a download is attempted. Reading titles, durations and caption lists keeps working throughout, so a successful-looking start proves nothing about the download.
+- **Download refused (403 / "sign in to confirm you're not a bot" / "only images are available")** → almost always an out-of-date yt-dlp, not a problem with the video. yt-dlp is perishable: sites change their defences every few weeks and yt-dlp answers within days, so a copy more than a month old is a likely failure. Homebrew's build is doubly affected — it lags on version *and* omits `curl_cffi`, so its browser-impersonation targets all read "unavailable". The scripts pick the **best** yt-dlp installed rather than the first on `PATH` and call it by absolute path, so a Homebrew copy sitting ahead of a pipx one no longer decides which runs — you do not need to tell the user to reorder `PATH`. If the message still appears, every copy on the machine is bad: give them the command the error prints (`pipx install --force 'yt-dlp[default,curl-cffi]'`). The error names which binary actually ran, which is the first thing to check when several are installed. Reading titles, durations and caption lists keeps working throughout, so a successful-looking start proves nothing about the download.
 - **Whisper request fails** → the error is printed to stderr (likely: invalid key or rate limit). Audio over the API's 25 MB upload cap is split into chunks and transcribed automatically, so length alone won't fail it; if some chunks fail the transcript is partial and the dropped chunks are noted on stderr. The report will say "none available" only if every chunk fails. You can retry with `--whisper openai` if Groq failed (or vice versa).
 
 ## Token efficiency
@@ -289,6 +291,8 @@ If you already watched a video this session and the user asks a follow-up, do **
 - Does not share API keys between providers (Groq key only goes to `api.groq.com`, OpenAI key only goes to `api.openai.com`)
 - Does not log, cache, or write API keys to stdout, stderr, or output files
 - Does not persist anything outside the working directory and `~/.config/watch/.env` — clean up the working directory when you're done (Step 5)
+
+**Work-dir output:** each run writes `frames.json` beside the extracted images — one entry per frame with its filename, absolute timestamp and selection reason, plus the run's settings (frame width and why, detail, download ceiling, range, transcript source). Use it when you need the frame-to-timestamp mapping after the fact: the report on stdout carries the same mapping, but it is mostly transcript and gets truncated or piped away, which leaves a directory of JPEGs with nothing to say when they happened. Cite frames by timestamp from this file rather than estimating from frame numbers.
 
 **Bundled scripts:** `scripts/watch.py` (entry point), `scripts/download.py` (yt-dlp wrapper), `scripts/frames.py` (ffmpeg frame extraction), `scripts/transcribe.py` (caption selection + Whisper orchestration), `scripts/whisper.py` (Groq / OpenAI clients), `scripts/setup.py` (preflight + installer)
 

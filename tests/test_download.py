@@ -29,6 +29,11 @@ def _capture_argv(monkeypatch: pytest.MonkeyPatch, *, output: str = "") -> list[
     output so it can diagnose a failure) must be stubbed — leaving either live
     turns these into real network calls against YouTube.
     """
+    # download.py resolves the best yt-dlp before building argv, which shells
+    # out to probe each candidate and caches the result under ~/.config/watch.
+    # Stub it: these tests are about the argv, and must neither record the
+    # probe's own calls nor touch the developer's real config dir.
+    monkeypatch.setattr(download, "resolve_ytdlp", lambda: "yt-dlp")
     calls: list[list[str]] = []
 
     class _Result:

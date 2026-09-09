@@ -17,6 +17,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 from config import DEFAULT_QUALITY  # noqa: E402
+from setup import YTDLP_UPGRADE_COMMAND, probe_ytdlp, resolve_ytdlp  # noqa: E402
 
 
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".flv", ".wmv"}
@@ -74,13 +75,21 @@ def _pick_video(out_dir: Path) -> Path | None:
 
 def fetch_captions(url: str, out_dir: Path) -> dict:
     """Fetch metadata and best available VTT captions without downloading video."""
-    if shutil.which("yt-dlp") is None:
-        raise SystemExit("yt-dlp is not installed. Install with: brew install yt-dlp")
+    # Resolve by capability rather than PATH order — see resolve_ytdlp. A bare
+    # "yt-dlp" here is what let Homebrew's stale, curl_cffi-less build shadow
+    # the pipx copy that setup itself tells the user to install.
+    ytdlp = resolve_ytdlp()
+    if shutil.which(ytdlp) is None:
+        raise SystemExit(
+            "yt-dlp is not installed. Install with:\n"
+            f"  {YTDLP_UPGRADE_COMMAND}\n"
+            "(Homebrew's build lags and omits curl_cffi, so downloads get refused.)"
+        )
 
     out_dir.mkdir(parents=True, exist_ok=True)
     output_template = str(out_dir / "video.%(ext)s")
     cmd = [
-        "yt-dlp",
+        ytdlp,
         "--skip-download",
         "--write-info-json",
         "--write-subs",
@@ -198,14 +207,13 @@ def diagnose_failure(output: str) -> str | None:
 
 
 def _ytdlp_state_line() -> str | None:
-    """One line describing the installed yt-dlp, for a failure message.
+    """One line describing the yt-dlp that actually ran, for a failure message.
 
-    Imported lazily and fail-open: diagnosing a download failure must never
-    itself raise, and a normal run should not pay for the probe.
+    Fail-open: diagnosing a download failure must never itself raise. Naming the
+    binary matters here — with several copies installed, "which one ran?" is the
+    first thing anyone needs to know.
     """
     try:
-        from setup import probe_ytdlp  # noqa: PLC0415
-
         probe = probe_ytdlp()
     except Exception:
         return None
@@ -220,7 +228,11 @@ def _ytdlp_state_line() -> str | None:
         else "impersonation available" if impersonation is True
         else "impersonation state unknown"
     )
-    return f"Your yt-dlp: {version}{age_note} at {probe.get('path')} — {imp_note}."
+    line = f"Ran yt-dlp {version}{age_note} at {probe.get('path')} — {imp_note}."
+    shadowed = probe.get("shadowed") or []
+    if shadowed:
+        line += f" (Chosen over {len(shadowed)} copy/copies earlier on PATH.)"
+    return line
 
 
 def _run_streaming(cmd: list[str]) -> tuple[int, str]:
@@ -284,15 +296,23 @@ def download_url(
     audio_only: bool = False,
     quality: str = DEFAULT_QUALITY,
 ) -> dict:
-    if shutil.which("yt-dlp") is None:
-        raise SystemExit("yt-dlp is not installed. Install with: brew install yt-dlp")
+    # Resolve by capability rather than PATH order — see resolve_ytdlp. A bare
+    # "yt-dlp" here is what let Homebrew's stale, curl_cffi-less build shadow
+    # the pipx copy that setup itself tells the user to install.
+    ytdlp = resolve_ytdlp()
+    if shutil.which(ytdlp) is None:
+        raise SystemExit(
+            "yt-dlp is not installed. Install with:\n"
+            f"  {YTDLP_UPGRADE_COMMAND}\n"
+            "(Homebrew's build lags and omits curl_cffi, so downloads get refused.)"
+        )
 
     out_dir.mkdir(parents=True, exist_ok=True)
     output_template = str(out_dir / "video.%(ext)s")
 
     fmt = format_selector(quality, audio_only=audio_only)
     cmd = [
-        "yt-dlp",
+        ytdlp,
         "-N", "8",
         "-f", fmt,
         "--merge-output-format", "mp4",
