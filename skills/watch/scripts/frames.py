@@ -55,13 +55,28 @@ SCREEN_FRAME_CAP = 40
 # Below this the source has no detail to preserve — _scale_filter never upscales
 # (it takes min(resolution, iw)), so raising the width would change nothing.
 SCREEN_MIN_WIDTH = 1280
-# Screen-recording probe. The signal is FLATNESS — the share of a frame's pixels
-# sitting at one luma value — because a UI is mostly uniform chrome and
-# background, while camera footage is gradients everywhere. Measured on 1080p
-# YouTube clips, median over 6 samples (sliding 2-bucket window):
+# Screen-recording probe. Two axes, both needed; a frame counts as screen-like
+# only if it passes both, and a clip is a screen recording if most sampled
+# frames do.
 #
-#     screen : terminal 0.81, n8n/console 0.76, excel 0.70, vscode 0.67
-#     camera : TED talk 0.23, cooking 0.17, travel vlog 0.12
+#   FLATNESS, per TILE — the share of a region's pixels at one luma value. A UI
+#   is mostly uniform chrome and background; camera footage is gradients. This
+#   is measured on a 3x3 grid rather than the whole frame because the common
+#   tutorial layout is picture-in-picture: a large flat screen capture with a
+#   small busy webcam inset. Averaged whole-frame, that composite lands near the
+#   boundary (measured 0.41-0.49 on the n8n masterclass) and reads as camera
+#   footage — a false negative on precisely the video this exists for. Per tile
+#   it is unambiguous: the screen region scores 0.72+, the inset 0.13, and 4+
+#   tiles clear the bar. Measured median flat tiles out of 9:
+#
+#       screen : 4-7   (worst case 4, the picture-in-picture sections)
+#       camera : 0-1   (TED talk 1, everything else 0)
+#
+#   DETAIL — mean absolute difference between horizontally adjacent pixels.
+#   This is a guard, not a discriminator: a near-black frame is flat everywhere
+#   and passes the tile test with 9/9, but has nothing to resolve, so raising
+#   the frame width would spend tokens for no gain. A night-sky timelapse scores
+#   0.23 here against 2.26+ for every screen recording measured.
 #
 # Motion is deliberately NOT used, though it is the intuitive choice. Adjacent
 # frames are near-identical in BOTH classes once YouTube's encoder has denoised
@@ -72,13 +87,20 @@ SCREEN_PROBE_HEIGHT = 108
 # 32 buckets of 8 luma levels, scored over a sliding pair of buckets so a
 # uniform background straddling a bucket edge still counts as one region.
 SCREEN_FLAT_BUCKETS = 32
-# Midway between the two measured groups (camera max 0.23, screen min 0.67).
-SCREEN_FLATNESS_THRESHOLD = 0.45
-# Sample points spread across the range; the MEDIAN decides. A mean would be
-# swung by a title card or a fade to black, which are perfectly flat and appear
-# in plenty of camera footage — one such frame is exactly what the TED talk
-# control contributed (single sample 0.77, median 0.23).
+SCREEN_TILE_GRID = 3
+# A tile this uniform is UI chrome rather than photographic content.
+SCREEN_TILE_FLATNESS = 0.6
+# Of 9 tiles. Screen recordings measured 4-7, camera footage 0-1, so 3 sits
+# below every true positive and above every true negative.
+SCREEN_MIN_FLAT_TILES = 3
+# Below this there is no fine structure for a wider frame to preserve.
+SCREEN_DETAIL_FLOOR = 1.0
+# Sample points spread across the range; a MAJORITY decides. Voting per frame
+# rather than averaging a score keeps a title card or a fade to black from
+# swinging the result — those fail the detail guard individually and are
+# outvoted anyway.
 SCREEN_PROBE_POINTS = 6
+SCREEN_VOTE_RATIO = 0.5
 
 
 def _scale_filter(resolution: int) -> str:
@@ -217,12 +239,52 @@ def _frame_flatness(frame: bytes) -> float:
     return best / len(frame)
 
 
-def _probe_flatness(video_path: str, at_seconds: float) -> float | None:
-    """Flatness of one frame at ``at_seconds``, or None if it can't be decoded.
+def _frame_detail(frame: bytes) -> float:
+    """Mean absolute difference between horizontally adjacent pixels.
+
+    A proxy for how much fine structure a frame carries. Near zero for a frame
+    with nothing in it (night sky, fade to black), which is the case the flatness
+    test alone cannot tell apart from a blank UI.
+    """
+    total = 0
+    count = 0
+    for y in range(SCREEN_PROBE_HEIGHT):
+        row = frame[y * SCREEN_PROBE_WIDTH:(y + 1) * SCREEN_PROBE_WIDTH]
+        total += sum(abs(a - b) for a, b in zip(row, row[1:]))
+        count += len(row) - 1
+    return total / count if count else 0.0
+
+
+def _flat_tile_count(frame: bytes) -> int:
+    """How many of the SCREEN_TILE_GRID^2 tiles are uniform enough to be UI."""
+    tile_w = SCREEN_PROBE_WIDTH // SCREEN_TILE_GRID
+    tile_h = SCREEN_PROBE_HEIGHT // SCREEN_TILE_GRID
+    count = 0
+    for gy in range(SCREEN_TILE_GRID):
+        for gx in range(SCREEN_TILE_GRID):
+            tile = bytearray()
+            for y in range(gy * tile_h, (gy + 1) * tile_h):
+                start = y * SCREEN_PROBE_WIDTH + gx * tile_w
+                tile += frame[start:start + tile_w]
+            if _frame_flatness(bytes(tile)) >= SCREEN_TILE_FLATNESS:
+                count += 1
+    return count
+
+
+def _frame_is_screenlike(frame: bytes) -> tuple[bool, float, int]:
+    """Judge one frame. Returns ``(verdict, detail, flat_tiles)``."""
+    detail = _frame_detail(frame)
+    tiles = _flat_tile_count(frame)
+    return (detail >= SCREEN_DETAIL_FLOOR and tiles >= SCREEN_MIN_FLAT_TILES), detail, tiles
+
+
+def _probe_frame(video_path: str, at_seconds: float) -> bytes | None:
+    """Decode one frame at ``at_seconds`` as raw grayscale, or None on failure.
 
     Fast-seek single-frame decode, downscaled by ffmpeg so we stay pure-stdlib.
-    The scale is deliberately not aspect-preserving: a luma histogram does not
-    care about geometry, and a fixed size keeps the byte count predictable.
+    The scale is deliberately not aspect-preserving: neither a luma histogram nor
+    a neighbour-difference cares about geometry, and a fixed size keeps the byte
+    count predictable.
     """
     cmd = [
         "ffmpeg",
@@ -242,7 +304,7 @@ def _probe_flatness(video_path: str, at_seconds: float) -> float | None:
     expected = SCREEN_PROBE_WIDTH * SCREEN_PROBE_HEIGHT
     if result.returncode != 0 or len(result.stdout) < expected:
         return None
-    return _frame_flatness(result.stdout[:expected])
+    return result.stdout[:expected]
 
 
 def detect_screen_recording(
@@ -253,11 +315,12 @@ def detect_screen_recording(
 ) -> tuple[bool, dict]:
     """Decide whether the source is a screen capture rather than camera footage.
 
-    Measured, not guessed: sample frames across the range and take the median
-    flatness (see SCREEN_FLATNESS_THRESHOLD for the numbers this is calibrated
-    against). Aspect ratio is deliberately not part of the test — a 4:3
-    screencast is still a screencast, and 16:9 is just as true of every talking
-    head, so it would only add false negatives.
+    Measured, not guessed: sample frames across the range, judge each on tiled
+    flatness plus a detail guard, and take a majority vote (see the SCREEN_*
+    constants for the numbers this is calibrated against). Aspect ratio is
+    deliberately not part of the test — a 4:3 screencast is still a screencast,
+    and 16:9 is just as true of every talking head, so it would only add false
+    negatives.
 
     Fail-open: any probe trouble returns ``(False, ...)`` and the caller keeps
     the ordinary default.
@@ -267,7 +330,9 @@ def detect_screen_recording(
         "width": width,
         "height": meta.get("height"),
         "samples": 0,
-        "flatness": None,
+        "screenlike": 0,
+        "flat_tiles": None,
+        "detail": None,
         "reason": "",
     }
     if width < SCREEN_MIN_WIDTH:
@@ -284,18 +349,25 @@ def detect_screen_recording(
     # Sample strictly inside the range: the first and last moments are often a
     # title card or a fade, which are flat in every kind of video.
     points = [lo + span * (i + 1) / (SCREEN_PROBE_POINTS + 1) for i in range(SCREEN_PROBE_POINTS)]
-    scores = [s for s in (_probe_flatness(video_path, p) for p in points) if s is not None]
-    if not scores:
+    judged = [
+        _frame_is_screenlike(frame)
+        for frame in (_probe_frame(video_path, p) for p in points)
+        if frame is not None
+    ]
+    if not judged:
         evidence["reason"] = "frame probe returned nothing"
         return False, evidence
 
-    flatness = statistics.median(scores)
-    evidence["samples"] = len(scores)
-    evidence["flatness"] = round(flatness, 3)
-    detected = flatness >= SCREEN_FLATNESS_THRESHOLD
+    votes = sum(1 for verdict, _, _ in judged if verdict)
+    evidence["samples"] = len(judged)
+    evidence["screenlike"] = votes
+    evidence["flat_tiles"] = statistics.median([tiles for _, _, tiles in judged])
+    evidence["detail"] = round(statistics.median([d for _, d, _ in judged]), 2)
+    detected = votes / len(judged) >= SCREEN_VOTE_RATIO
     evidence["reason"] = (
-        f"median flatness {flatness:.2f} across {len(scores)} samples, "
-        f"screen-recording threshold {SCREEN_FLATNESS_THRESHOLD:.2f}"
+        f"{votes}/{len(judged)} sampled frames look like a screen — median "
+        f"{evidence['flat_tiles']:g} of {SCREEN_TILE_GRID ** 2} tiles flat, "
+        f"detail {evidence['detail']:g}"
     )
     return detected, evidence
 

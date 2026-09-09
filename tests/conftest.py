@@ -98,6 +98,57 @@ def build_photographic_clip(path: Path, duration: float = 4.0, fps: int = 10) ->
     ])
 
 
+def build_pip_clip(path: Path, duration: float = 4.0, fps: int = 10) -> None:
+    """Screen capture with a busy webcam inset in the corner.
+
+    The layout that defeats whole-frame flatness: averaging a large flat screen
+    against a small detailed inset lands near the boundary and reads as camera
+    footage. Per-tile scoring has to see through it.
+    """
+    _run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-t", str(duration), "-i", f"color=c=white:s=1280x720:r={fps}",
+        "-f", "lavfi", "-t", str(duration), "-i", f"testsrc2=s=340x200:r={fps}",
+        "-filter_complex",
+        "[0:v]drawbox=x=40:y=40:w=380:h=560:color=black:t=fill,"
+        "drawbox=x=520:y=80:w=300:h=14:color=gray:t=fill[bg];"
+        "[bg][1:v]overlay=x=0:y=520[out]",
+        "-map", "[out]",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        str(path),
+    ])
+
+
+def build_dark_clip(path: Path, duration: float = 4.0, fps: int = 10) -> None:
+    """Near-black with faint specks — flat everywhere but nothing to resolve.
+
+    Passes the flatness test on every tile, so only the detail guard rejects it.
+    A night-sky timelapse is the real-world case.
+    """
+    _run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-t", str(duration), "-i", f"color=c=black:s=1280x720:r={fps}",
+        "-vf", "drawbox=x=300:y=200:w=2:h=2:color=white:t=fill,"
+               "drawbox=x=900:y=500:w=2:h=2:color=white:t=fill",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        str(path),
+    ])
+
+
+@pytest.fixture(scope="session")
+def pip_clip(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    path = tmp_path_factory.mktemp("clips") / "pip.mp4"
+    build_pip_clip(path)
+    return path
+
+
+@pytest.fixture(scope="session")
+def dark_clip(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    path = tmp_path_factory.mktemp("clips") / "dark.mp4"
+    build_dark_clip(path)
+    return path
+
+
 @pytest.fixture(scope="session")
 def screen_clip(tmp_path_factory: pytest.TempPathFactory) -> Path:
     path = tmp_path_factory.mktemp("clips") / "screen.mp4"

@@ -158,16 +158,23 @@ Optional flags:
 
 Software tutorials, coding walkthroughs, slide decks and UI demos carry their payload as small on-screen text. At the ordinary 512px frame width that text is destroyed — menu items in a 1920-wide capture land about three pixels tall — and a better download does **not** fix it, because the loss happens at frame extraction, not at download.
 
-So the script measures the source before extracting. It samples six frames and computes their median *flatness* — the share of pixels sitting at one luma value. A UI is mostly uniform chrome and background and scores 0.57-0.81; camera footage is gradients everywhere and scores 0.07-0.23. Above 0.45 the frame width goes to 1536 and the frame cap drops to 40 to hold the token cost roughly steady.
+So the script measures the source before extracting. It samples six frames, splits each into a 3×3 grid, and asks two questions per frame: how many tiles are *flat* (nearly all pixels at one luma value — UI chrome and background), and whether the frame carries any fine *detail* at all. A frame counts as screen-like with 3+ flat tiles and detail above the floor; a majority of screen-like frames makes it a screen recording. Then the frame width goes to 1536 and the frame cap drops to 40, holding the token cost roughly steady.
 
-(Motion is deliberately not the test, though it is the intuitive choice. After a platform re-encodes an upload, adjacent frames are near-identical for a talking head as well as a screencast, so a motion test reports everything as a screen recording.)
+Measured across real 1080p uploads: screen recordings show 4-7 flat tiles of 9, camera footage 0-1.
+
+Two things that look like they should work and don't, both ruled out by measurement:
+
+- **Motion.** Once a platform re-encodes and denoises an upload, adjacent frames are near-identical for a talking head as well as a screencast, so a motion test reports everything as a screen recording.
+- **Whole-frame flatness.** The standard tutorial layout is picture-in-picture — a large flat screen capture with a small busy webcam inset. Averaged over the whole frame that composite scores 0.41-0.49, under the threshold, so the most common kind of tutorial would be missed. Per tile it is unambiguous: the screen region scores 0.72+, the inset 0.13.
+
+The detail floor is what stops a near-black frame (night sky, fade to black) from registering as a flat UI: it scores 9 flat tiles of 9, but there is nothing in it to resolve, so a wider frame would spend tokens for no gain.
 
 What this means for you:
 - **Mention it when it fires.** The stderr line and the report's **Frame size** line both name the measured flatness. "This is a screen recording, so I pulled fewer frames at higher resolution" is useful context for the user.
 - **Long tutorials still want `--start`/`--end`.** A 90-minute masterclass at 40 frames is one frame every two minutes. Read the transcript first, find the section the user cares about, then re-run focused on it — that is what buys the budget for detail.
 - **`--timestamps` pairs well with it.** After reading the transcript, grab the exact moments where the presenter says "click here" / "as you can see".
 - **If text is still too small**, re-run with `--resolution 1998` (the ceiling) on a tight range.
-- **If it misfires** on a flat-but-photographic source (a dark night scene, a plain-background interview), pass `--resolution 512` to force the cheap width back.
+- **If it misfires**, pass `--resolution 512` to force the cheap width back. The report's **Frame size** line shows the tile count and detail that drove the decision, so you can say why it fired.
 
 ### Focusing on a section (higher frame rate)
 
