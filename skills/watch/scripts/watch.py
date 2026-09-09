@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -21,6 +23,55 @@ from download import download, fetch_captions, is_url  # noqa: E402
 from frames import DEFAULT_RESOLUTION, MAX_FPS, SCREEN_FRAME_CAP, SCREEN_RESOLUTION, auto_fps, auto_fps_focus, detect_screen_recording, extract_at_timestamps, extract_keyframes, extract_scene_or_uniform, format_time, get_metadata, merge_frames, parse_time, parse_timestamps  # noqa: E402
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 from whisper import load_api_key, transcribe_video  # noqa: E402
+
+
+_SKILL_VERSION_RE = re.compile(r"^version:\s*[\"']?([^\"'\s]+)", re.MULTILINE)
+
+
+def skill_provenance() -> dict:
+    """Which build of the skill produced this output.
+
+    frames.json already records what settings were used; this records what code
+    applied them, which is what makes a cited frame reproducible. Worth having
+    because the answer moves: the frame width alone changed twice in one day,
+    so "extracted at 1536px" is not enough to reconstruct a run months later.
+
+    ``commit`` is populated only when the skill happens to sit in a git checkout
+    — an `npx skills add` install is a plain copy of the files and has no repo,
+    which is not an error. ``dirty`` matters because a commit hash is a lie if
+    the working files have been edited on top of it.
+
+    Fail-open throughout: provenance is metadata, and no failure here may cost
+    the user a run whose frames are already extracted.
+    """
+    info: dict = {"version": None, "commit": None, "dirty": None}
+
+    skill_md = SCRIPT_DIR.parent / "SKILL.md"
+    try:
+        # Only the frontmatter is worth scanning, and it is at the top.
+        match = _SKILL_VERSION_RE.search(skill_md.read_text(encoding="utf-8")[:2000])
+        if match:
+            info["version"] = match.group(1)
+    except OSError:
+        pass
+
+    try:
+        rev = subprocess.run(
+            ["git", "-C", str(SCRIPT_DIR), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if rev.returncode == 0:
+            info["commit"] = rev.stdout.strip() or None
+            status = subprocess.run(
+                ["git", "-C", str(SCRIPT_DIR), "status", "--porcelain", "--", "."],
+                capture_output=True, text=True, timeout=5,
+            )
+            if status.returncode == 0:
+                info["dirty"] = bool(status.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    return info
 
 
 def write_manifest(
@@ -52,6 +103,7 @@ def write_manifest(
     since every frame and the whole report are already produced.
     """
     payload = {
+        "skill": skill_provenance(),
         "source": source,
         "title": info.get("title"),
         "uploader": info.get("uploader"),

@@ -99,3 +99,46 @@ def test_unwritable_dir_does_not_fail_the_run(tmp_path):
         transcript_source=None, transcript_segments=[],
     )
     assert result is None
+
+
+# ---- provenance ------------------------------------------------------------
+#
+# frames.json records what settings were used; this records what code applied
+# them. It earns its place because the answer moves — the screen-recording
+# frame width changed twice in a single day — so "extracted at 1536px" is not
+# enough to reconstruct a run later. A frame cited in a report needs both.
+
+def test_manifest_records_which_build_produced_it(tmp_path):
+    _, data = _write(tmp_path)
+    assert set(data["skill"]) == {"version", "commit", "dirty"}
+
+
+def test_version_comes_from_the_skill_frontmatter():
+    """The version in SKILL.md's frontmatter is the one users see quoted."""
+    assert watch.skill_provenance()["version"] == "0.2.0"
+
+
+def test_commit_is_recorded_when_the_skill_sits_in_a_checkout(tmp_path):
+    """These tests run from a git worktree, so a hash should be present and the
+    tree-dirty flag should be a real boolean rather than unknown."""
+    prov = watch.skill_provenance()
+    assert prov["commit"] and len(prov["commit"]) >= 7
+    assert isinstance(prov["dirty"], bool)
+
+
+def test_provenance_survives_a_non_git_install(monkeypatch):
+    """`npx skills add` copies the files with no repo. That is a normal install,
+    not an error: commit and dirty come back None and nothing raises."""
+    def no_git(*args, **kwargs):
+        raise OSError("git not found")
+
+    monkeypatch.setattr(watch.subprocess, "run", no_git)
+    prov = watch.skill_provenance()
+    assert prov["commit"] is None and prov["dirty"] is None
+    assert prov["version"] == "0.2.0"          # still read from SKILL.md
+
+
+def test_provenance_survives_a_missing_skill_md(monkeypatch, tmp_path):
+    """Never let metadata collection cost a run whose frames already exist."""
+    monkeypatch.setattr(watch, "SCRIPT_DIR", tmp_path / "nowhere")
+    assert watch.skill_provenance()["version"] is None
