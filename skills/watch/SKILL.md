@@ -63,7 +63,9 @@ On follow-up `/watch` calls in the same session, use the silent check:
 python3 "${SKILL_DIR}/scripts/setup.py" --check
 ```
 
-This is a <100ms lookup. Exit 0 means /watch can run — this **includes a user who finished setup without a Whisper key** (keyless is allowed). On exit 0 the script emits **nothing** — proceed to Step 1 without comment. **Do NOT announce "setup is complete" to the user** — they don't need a status message on every turn. The only acceptable user-visible output from Step 0 is when remediation is required.
+This is a <100ms lookup (the yt-dlp health probe it needs is cached for 24h). Exit 0 means /watch can run — this **includes a user who finished setup without a Whisper key** (keyless is allowed). On exit 0 with no output, proceed to Step 1 without comment. **Do NOT announce "setup is complete" to the user** — they don't need a status message on every turn.
+
+**`[watch] warning:` lines are the exception, and they can appear on exit 0.** They mean the install is usable but a download is likely to be refused — a yt-dlp more than a month old, or one built without browser impersonation. These are not fatal, so do not stop; but do pass the warning and its fix command on to the user, because the alternative is a download that fails minutes later. See "Download refused" under Failure modes.
 
 On non-zero exit, follow the table:
 
@@ -144,12 +146,28 @@ Optional flags:
 - `--start T` / `--end T` — focus on a section. Accepts `SS`, `MM:SS`, or `HH:MM:SS`. When either is set, fps auto-scales denser (see "Focusing on a section" below).
 - `--timestamps T1,T2,…` — grab a frame at each of these absolute timestamps (`SS`, `MM:SS`, or `HH:MM:SS`). Use this after reading the transcript to capture deictic moments the presenter flags ("look here", "as you can see", "notice this") that visual selection alone may miss. See "Transcript-cue frames" below.
 - `--max-frames N` — override the preset cap for tighter token budget (e.g. `--max-frames 40`)
-- `--resolution W` — change frame width in px (default 512; bump to 1024 only if the user needs to read on-screen text)
+- `--resolution W` — frame width in px. Default is **automatic**: 512 for ordinary footage, 1536 when the source is measured to be a screen recording (see "Screen recordings" below). Pass this only to override that decision — e.g. `--resolution 512` to force the cheap width on a tutorial you only need the gist of, or `--resolution 1998` (the ceiling) for exceptionally small text.
+- `--quality H` — max download height: `360`, `480`, `720`, `1080` (default), `1440`, `2160`, or `best`. Set a persistent default with `WATCH_QUALITY` in `~/.config/watch/.env`. Lower it on a slow connection; raise it when the user needs to read dense on-screen text. A ceiling is a preference, not a requirement — a video that only exists above it still downloads.
 - `--fps F` — override auto-fps (clamped to 2 fps max)
 - `--out-dir DIR` — keep working files somewhere specific (default: an auto-generated tmp dir)
 - `--whisper groq|openai` — force a specific Whisper backend (default: prefer Groq if both keys exist)
 - `--no-whisper` — disable the Whisper fallback entirely (frames-only if no captions)
 - `--no-dedup` — keep near-duplicate frames. By default a frame-delta pass drops frames that are visually near-identical to the previous kept one (held slides, static screen recordings, paused video) so the frame budget goes to distinct content; the report's **Frames** line notes how many were dropped. Pass this only if the user needs every sampled frame (e.g. judging subtle frame-to-frame motion).
+
+### Screen recordings (automatic, but say so in your answer)
+
+Software tutorials, coding walkthroughs, slide decks and UI demos carry their payload as small on-screen text. At the ordinary 512px frame width that text is destroyed — menu items in a 1920-wide capture land about three pixels tall — and a better download does **not** fix it, because the loss happens at frame extraction, not at download.
+
+So the script measures the source before extracting. It samples six frames and computes their median *flatness* — the share of pixels sitting at one luma value. A UI is mostly uniform chrome and background and scores 0.57-0.81; camera footage is gradients everywhere and scores 0.07-0.23. Above 0.45 the frame width goes to 1536 and the frame cap drops to 40 to hold the token cost roughly steady.
+
+(Motion is deliberately not the test, though it is the intuitive choice. After a platform re-encodes an upload, adjacent frames are near-identical for a talking head as well as a screencast, so a motion test reports everything as a screen recording.)
+
+What this means for you:
+- **Mention it when it fires.** The stderr line and the report's **Frame size** line both name the measured flatness. "This is a screen recording, so I pulled fewer frames at higher resolution" is useful context for the user.
+- **Long tutorials still want `--start`/`--end`.** A 90-minute masterclass at 40 frames is one frame every two minutes. Read the transcript first, find the section the user cares about, then re-run focused on it — that is what buys the budget for detail.
+- **`--timestamps` pairs well with it.** After reading the transcript, grab the exact moments where the presenter says "click here" / "as you can see".
+- **If text is still too small**, re-run with `--resolution 1998` (the ceiling) on a tight range.
+- **If it misfires** on a flat-but-photographic source (a dark night scene, a plain-background interview), pass `--resolution 512` to force the cheap width back.
 
 ### Focusing on a section (higher frame rate)
 
@@ -234,7 +252,8 @@ Both keys live in `~/.config/watch/.env`. The script prefers Groq when both are 
 - **Setup preflight failed** → run `python3 "${SKILL_DIR}/scripts/setup.py"` (auto-installs ffmpeg/yt-dlp via brew on macOS, scaffolds the `.env`). For API key, ask the user via `AskUserQuestion` and write it to `~/.config/watch/.env`.
 - **No transcript available** → captions missing AND (no Whisper key OR Whisper API failed). Script prints a hint pointing to setup. Proceed frames-only and tell the user.
 - **Long video warning printed** → acknowledge it in your answer. Offer to re-run focused on a specific section via `--start`/`--end` rather than a sparse full-video scan.
-- **Download fails** → yt-dlp's error goes to stderr. If it's a login-required or region-locked video, tell the user plainly; do not keep retrying.
+- **Download fails** → the script diagnoses the common causes and prints the fix; relay that message rather than paraphrasing it. If it's a login-required, private, or region-locked video, tell the user plainly and do not keep retrying.
+- **Download refused (403 / "sign in to confirm you're not a bot" / "only images are available")** → almost always an out-of-date yt-dlp, not a problem with the video. yt-dlp is perishable: sites change their defences every few weeks and yt-dlp answers within days, so a copy more than a month old is a likely failure. Homebrew's build is doubly affected — it lags on version *and* omits `curl_cffi`, so its browser-impersonation targets all read "unavailable". Give the user the command the error message prints (`pipx install --force 'yt-dlp[default,curl-cffi]'`) and note that `~/.local/bin` must come before `/opt/homebrew/bin` on `PATH`. Preflight warns about both conditions before a download is attempted. Reading titles, durations and caption lists keeps working throughout, so a successful-looking start proves nothing about the download.
 - **Whisper request fails** → the error is printed to stderr (likely: invalid key or rate limit). Audio over the API's 25 MB upload cap is split into chunks and transcribed automatically, so length alone won't fail it; if some chunks fail the transcript is partial and the dropped chunks are noted on stderr. The report will say "none available" only if every chunk fails. You can retry with `--whisper openai` if Groq failed (or vice versa).
 
 ## Token efficiency
@@ -242,7 +261,8 @@ Both keys live in `~/.config/watch/.env`. The script prefers Groq when both are 
 This skill burns tokens primarily on frames. Order of magnitude:
 - 80 frames at 512px wide is roughly 50-80k image tokens depending on aspect ratio.
 - The transcript is cheap (a few thousand tokens at most for a 10-minute video).
-- Bumping `--resolution` to 1024 roughly quadruples the image tokens per frame. Only do it when necessary.
+- Image tokens scale with pixel count, so width costs quadratically: 1024px is ~4x a 512px frame, 1536px ~9x.
+- A detected screen recording therefore lowers the frame cap to 40 as it raises the width, keeping the total bill close to where it was. If the user needs both the readability and the coverage, pass `--max-frames` explicitly — it overrides the reduction.
 
 If you already watched a video this session and the user asks a follow-up, do **not** re-run the script — you already have the frames and transcript in context. Just answer from what you have.
 

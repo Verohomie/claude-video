@@ -13,6 +13,14 @@ DEFAULT_DETAIL = "balanced"
 
 DETAILS = {"transcript", "efficient", "balanced", "token-burner"}
 
+# Download quality ceiling, as a max height in pixels ("best" = no ceiling).
+# 1080 rather than 720: a screen-recorded tutorial at 720p cannot be read no
+# matter how the frames are extracted, and the extra bytes are cheap next to a
+# wasted watch. Raise to 1440/2160 for dense UI; drop to 720 on a slow link.
+DEFAULT_QUALITY = "1080"
+
+QUALITIES = {"360", "480", "720", "1080", "1440", "2160", "best"}
+
 
 def read_env_file(path: Path | None = None) -> dict[str, str]:
     if path is None:
@@ -56,8 +64,18 @@ def get_config() -> dict[str, object]:
     if detail not in DETAILS:
         detail = DEFAULT_DETAIL
 
+    quality = (
+        os.environ.get("WATCH_QUALITY")
+        or file_values.get("WATCH_QUALITY")
+        or DEFAULT_QUALITY
+    )
+    quality = str(quality).strip().lower().rstrip("p")
+    if quality not in QUALITIES:
+        quality = DEFAULT_QUALITY
+
     return {
         "detail": detail,
+        "quality": quality,
         "config_file": str(CONFIG_FILE),
     }
 

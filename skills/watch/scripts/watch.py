@@ -15,9 +15,9 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from config import frame_cap, get_config  # noqa: E402
+from config import QUALITIES, frame_cap, get_config  # noqa: E402
 from download import download, fetch_captions, is_url  # noqa: E402
-from frames import MAX_FPS, auto_fps, auto_fps_focus, extract_at_timestamps, extract_keyframes, extract_scene_or_uniform, format_time, get_metadata, merge_frames, parse_time, parse_timestamps  # noqa: E402
+from frames import DEFAULT_RESOLUTION, MAX_FPS, SCREEN_FRAME_CAP, SCREEN_RESOLUTION, auto_fps, auto_fps_focus, detect_screen_recording, extract_at_timestamps, extract_keyframes, extract_scene_or_uniform, format_time, get_metadata, merge_frames, parse_time, parse_timestamps  # noqa: E402
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 from whisper import load_api_key, transcribe_video  # noqa: E402
 
@@ -29,7 +29,22 @@ def main() -> int:
     )
     ap.add_argument("source", help="Video URL or local file path")
     ap.add_argument("--max-frames", type=int, default=None, help="Override frame cap")
-    ap.add_argument("--resolution", type=int, default=512, help="Frame width in pixels (default 512)")
+    ap.add_argument(
+        "--resolution",
+        type=int,
+        default=None,
+        help=f"Frame width in pixels. Default: auto — {DEFAULT_RESOLUTION} for ordinary "
+             f"footage, {SCREEN_RESOLUTION} when the source is detected as a screen "
+             "recording (small on-screen text is unreadable below that).",
+    )
+    ap.add_argument(
+        "--quality",
+        type=str,
+        default=None,
+        choices=sorted(QUALITIES),
+        help="Max download height in pixels, or 'best' for no ceiling. "
+             "Default 1080 (override with WATCH_QUALITY in the config file).",
+    )
     ap.add_argument("--fps", type=float, default=None, help="Override auto-fps")
     ap.add_argument(
         "--detail",
@@ -70,6 +85,7 @@ def main() -> int:
 
     config = get_config()
     detail = args.detail or str(config["detail"])
+    quality = args.quality or str(config["quality"])
     configured_cap = frame_cap(detail)
     if args.max_frames is not None:
         max_frames = args.max_frames
@@ -115,13 +131,14 @@ def main() -> int:
         if url_source:
             print(
                 "[watch] downloading audio via yt-dlp…" if audio_only
-                else "[watch] downloading video via yt-dlp…",
+                else f"[watch] downloading video via yt-dlp (quality ceiling {quality})…",
                 file=sys.stderr,
             )
             dl = download(
                 args.source,
                 work / "download",
                 audio_only=audio_only,
+                quality=quality,
             )
         else:
             print("[watch] using local file…", file=sys.stderr)
@@ -152,6 +169,42 @@ def main() -> int:
     effective_duration = max(0.0, effective_end - effective_start)
     focused = start_sec is not None or end_sec is not None
 
+    # Frame width: honour an explicit --resolution, otherwise measure whether the
+    # source is a screen recording. A tutorial's whole payload is small on-screen
+    # text, which 512px destroys — and a better download does not help, because
+    # the loss happens at extraction. Raising the width ~9x the pixels per frame,
+    # so a detected screen recording also lowers the frame cap to keep the image
+    # token bill near where it was; an explicit --max-frames still wins.
+    screen_evidence: dict = {}
+    if args.resolution is not None:
+        resolution = args.resolution
+        resolution_source = "explicit"
+    elif video_path is None:
+        resolution = DEFAULT_RESOLUTION
+        resolution_source = "default"
+    else:
+        is_screen, screen_evidence = detect_screen_recording(
+            video_path, meta, start_seconds=start_sec, end_seconds=end_sec
+        )
+        resolution = SCREEN_RESOLUTION if is_screen else DEFAULT_RESOLUTION
+        resolution_source = "screen-recording" if is_screen else "default"
+        if is_screen:
+            print(
+                f"[watch] screen recording detected ({screen_evidence['reason']}) — "
+                f"frames at {resolution}px so on-screen text stays readable",
+                file=sys.stderr,
+            )
+            if args.max_frames is None:
+                capped = SCREEN_FRAME_CAP if max_frames is None else min(max_frames, SCREEN_FRAME_CAP)
+                if capped != max_frames:
+                    print(
+                        f"[watch] frame cap {max_frames or 'unlimited'} → {capped} to offset the "
+                        "~9x image-token cost per frame (override with --max-frames)",
+                        file=sys.stderr,
+                    )
+                max_frames = capped
+                budget_cap = capped
+
     if focused:
         fps, target = auto_fps_focus(effective_duration, max_frames=budget_cap)
     else:
@@ -180,7 +233,7 @@ def main() -> int:
             video_path,
             work / "frames",
             cue_timestamps,
-            resolution=args.resolution,
+            resolution=resolution,
             max_frames=max_frames,
             start_seconds=start_sec,
             end_seconds=end_sec,
@@ -205,7 +258,7 @@ def main() -> int:
             frames, frame_meta = extract_keyframes(
                 video_path,
                 work / "frames",
-                resolution=args.resolution,
+                resolution=resolution,
                 max_frames=detail_budget,
                 start_seconds=start_sec,
                 end_seconds=end_sec,
@@ -217,7 +270,7 @@ def main() -> int:
                 work / "frames",
                 fps=fps,
                 target_frames=target,
-                resolution=args.resolution,
+                resolution=resolution,
                 max_frames=detail_budget,
                 start_seconds=start_sec,
                 end_seconds=end_sec,
@@ -282,7 +335,11 @@ def main() -> int:
             f"({effective_duration:.1f}s)"
         )
     if meta.get("width") and meta.get("height"):
-        print(f"- **Resolution:** {meta['width']}x{meta['height']} ({meta.get('codec') or 'unknown codec'})")
+        ceiling = "" if not dl.get("downloaded") else f", downloaded at a {quality} ceiling"
+        print(
+            f"- **Resolution:** {meta['width']}x{meta['height']} "
+            f"({meta.get('codec') or 'unknown codec'}{ceiling})"
+        )
     range_mode = "focused" if focused else "full"
     print(f"- **Detail:** {detail}")
     detail_count = frame_meta.get("selected_count", 0)
@@ -306,7 +363,11 @@ def main() -> int:
             f"(transcript-cue{drop_note})"
         )
     if frames:
-        print(f"- **Frame size:** max {args.resolution}px wide, max 1998px tall")
+        size_note = {
+            "explicit": " (set with --resolution)",
+            "screen-recording": f" (auto-raised: {screen_evidence.get('reason', 'screen recording detected')})",
+        }.get(resolution_source, "")
+        print(f"- **Frame size:** max {resolution}px wide, max 1998px tall{size_note}")
     if transcript_segments:
         in_range = " in range" if focused else ""
         print(

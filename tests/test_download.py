@@ -7,6 +7,7 @@ bounded to the English-only pattern.
 """
 from __future__ import annotations
 
+import io
 import subprocess
 import sys
 from pathlib import Path
@@ -21,8 +22,13 @@ import download  # noqa: E402
 URL = "https://www.youtube.com/watch?v=rlOpbu3Enkw"
 
 
-def _capture_argv(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
-    """Stub subprocess.run inside download.py and record every argv."""
+def _capture_argv(monkeypatch: pytest.MonkeyPatch, *, output: str = "") -> list[list[str]]:
+    """Stub every subprocess entry point inside download.py and record each argv.
+
+    Both ``run`` (fetch_captions) and ``Popen`` (download_url, which tees yt-dlp's
+    output so it can diagnose a failure) must be stubbed — leaving either live
+    turns these into real network calls against YouTube.
+    """
     calls: list[list[str]] = []
 
     class _Result:
@@ -34,7 +40,16 @@ def _capture_argv(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
         calls.append(list(cmd))
         return _Result()
 
+    class _Popen:
+        def __init__(self, cmd, *args, **kwargs):
+            calls.append(list(cmd))
+            self.stdout = io.StringIO(output)
+
+        def wait(self):
+            return 0
+
     monkeypatch.setattr(download.subprocess, "run", fake_run)
+    monkeypatch.setattr(download.subprocess, "Popen", _Popen)
     return calls
 
 

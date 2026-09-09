@@ -24,6 +24,8 @@ import platform
 import shutil
 import subprocess
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -35,6 +37,17 @@ from config import get_config  # noqa: E402
 REQUIRED_BINARIES = ["ffmpeg", "ffprobe", "yt-dlp"]
 CONFIG_DIR = Path.home() / ".config" / "watch"
 CONFIG_FILE = CONFIG_DIR / ".env"
+
+# yt-dlp is perishable: sites change their defences every few weeks and yt-dlp
+# answers within days, so a copy older than this is a likely download failure
+# rather than merely a stale one.
+YTDLP_STALE_DAYS = 30
+# Probing costs two yt-dlp launches (~0.5s), and --check runs on every /watch
+# call, so the answer is cached. Keyed on the resolved binary path so swapping
+# installs re-probes immediately instead of reporting the old one for a day.
+YTDLP_PROBE_CACHE = CONFIG_DIR / ".ytdlp-probe.json"
+YTDLP_PROBE_TTL_SECONDS = 24 * 60 * 60
+YTDLP_UPGRADE_COMMAND = "pipx install --force 'yt-dlp[default,curl-cffi]'"
 ENV_TEMPLATE = """# /watch API configuration
 #
 # Whisper transcription fallback — used only when yt-dlp cannot get captions
@@ -56,6 +69,11 @@ OPENAI_API_KEY=
 # Allowed values: transcript | efficient | balanced | token-burner
 # Keep the value on its own line with no trailing comment.
 # WATCH_DETAIL=balanced
+
+# Download quality ceiling, as a max video height. Default 1080.
+# Allowed values: 360 | 480 | 720 | 1080 | 1440 | 2160 | best
+# Lower it on a slow connection; raise it for dense on-screen text.
+# WATCH_QUALITY=1080
 """
 
 
@@ -65,6 +83,127 @@ def _which(name: str) -> str | None:
 
 def _check_binaries() -> list[str]:
     return [b for b in REQUIRED_BINARIES if not _which(b)]
+
+
+def _ytdlp_run(args: list[str]) -> str | None:
+    """Run yt-dlp and return its stdout, or None on any failure. Fail-open:
+    a probe that cannot answer must never block or crash /watch."""
+    try:
+        result = subprocess.run(
+            ["yt-dlp", *args],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def _ytdlp_age_days(version: str | None) -> int | None:
+    """Days since a yt-dlp CalVer release string (``YYYY.MM.DD``)."""
+    if not version:
+        return None
+    head = version.strip().split()[0]
+    for fmt in ("%Y.%m.%d", "%Y.%m.%d.%f"):
+        try:
+            released = datetime.strptime(head, fmt)
+        except ValueError:
+            continue
+        return max(0, (datetime.now() - released).days)
+    return None
+
+
+def _probe_ytdlp_uncached(path: str) -> dict:
+    version_out = _ytdlp_run(["--version"])
+    version = version_out.strip().splitlines()[0].strip() if version_out else None
+
+    # --list-impersonate-targets exits 0 and still lists every target when the
+    # build has no curl_cffi — it just marks each one "(unavailable)" in the
+    # Source column. So presence of rows proves nothing; a usable target is a
+    # row NOT marked unavailable. Older builds lack the flag and return None.
+    targets_out = _ytdlp_run(["--list-impersonate-targets"])
+    impersonation: bool | None
+    if targets_out is None:
+        impersonation = None
+    else:
+        usable = [
+            line for line in targets_out.splitlines()
+            if line.strip()
+            and not line.startswith("[")
+            and not line.lower().startswith("client")
+            and set(line.strip()) != {"-"}
+            and "unavailable" not in line.lower()
+        ]
+        impersonation = bool(usable)
+
+    return {
+        "path": path,
+        "version": version,
+        "impersonation": impersonation,
+        "checked_at": time.time(),
+    }
+
+
+def probe_ytdlp(*, force: bool = False) -> dict:
+    """Installed yt-dlp version and whether it can impersonate a browser.
+
+    Both facts predict a failed download and both are one command away from
+    fixed, so they belong in preflight rather than being discovered halfway
+    through a download. Cached for ``YTDLP_PROBE_TTL_SECONDS``; ``age_days`` is
+    always recomputed from the cached version so it never goes stale itself.
+    """
+    path = _which("yt-dlp")
+    if path is None:
+        return {"path": None, "version": None, "impersonation": None, "age_days": None}
+
+    cached: dict | None = None
+    if not force:
+        try:
+            cached = json.loads(YTDLP_PROBE_CACHE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            cached = None
+        if not isinstance(cached, dict):
+            cached = None
+        elif (
+            cached.get("path") != path
+            or (time.time() - float(cached.get("checked_at") or 0)) > YTDLP_PROBE_TTL_SECONDS
+        ):
+            cached = None
+
+    probe = cached if cached is not None else _probe_ytdlp_uncached(path)
+    if cached is None:
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            YTDLP_PROBE_CACHE.write_text(json.dumps(probe), encoding="utf-8")
+        except OSError:
+            pass
+
+    probe = dict(probe)
+    probe["age_days"] = _ytdlp_age_days(probe.get("version"))
+    return probe
+
+
+def ytdlp_warnings(probe: dict) -> list[str]:
+    """Actionable one-liners for a yt-dlp that is likely to fail a download."""
+    if probe.get("path") is None:
+        return []
+    warnings: list[str] = []
+    age = probe.get("age_days")
+    if isinstance(age, int) and age > YTDLP_STALE_DAYS:
+        warnings.append(
+            f"yt-dlp {probe.get('version')} is {age} days old. Sites change their "
+            "defences every few weeks, so downloads are likely to be refused."
+        )
+    if probe.get("impersonation") is False:
+        warnings.append(
+            f"yt-dlp at {probe.get('path')} has no browser-impersonation targets "
+            "(built without curl_cffi). YouTube's bot check refuses downloads "
+            "from clients it cannot verify, while titles and captions keep working."
+        )
+    if warnings:
+        warnings.append(f"Fix both with: {YTDLP_UPGRADE_COMMAND}")
+    return warnings
 
 
 _PERM_WARNED: set[str] = set()
@@ -241,6 +380,12 @@ def _status() -> dict:
 
     can_proceed = (not missing) and (has_key or setup_complete)
 
+    # A stale or impersonation-less yt-dlp predicts a failed download but does
+    # not block one, so it is a warning and never gates can_proceed — plenty of
+    # sources download fine from an old build.
+    probe = probe_ytdlp()
+    warnings = ytdlp_warnings(probe)
+
     cfg = get_config()
     return {
         "status": status,
@@ -252,6 +397,9 @@ def _status() -> dict:
         "has_api_key": has_key,
         "config_file": str(CONFIG_FILE),
         "watch_detail": cfg["detail"],
+        "watch_quality": cfg["quality"],
+        "ytdlp": probe,
+        "warnings": warnings,
         "platform": platform.system(),
     }
 
@@ -269,6 +417,15 @@ def cmd_check() -> int:
       4 → both missing
     """
     s = _status()
+
+    # Warnings print whether or not setup is otherwise complete: a ready install
+    # with an expired yt-dlp is exactly the case that currently fails halfway
+    # through a download with a message that names no cause.
+    for warning in s["warnings"]:
+        sys.stderr.write(f"[watch] warning: {warning}\n")
+    if s["warnings"]:
+        sys.stderr.flush()
+
     if s["can_proceed"]:
         return 0
 
@@ -330,6 +487,11 @@ def cmd_install() -> int:
         print(f"[setup] created config: {CONFIG_FILE}")
     else:
         print(f"[setup] config exists: {CONFIG_FILE}")
+
+    # Re-probe rather than trusting the cache: the installer is exactly when a
+    # yt-dlp may have just been installed or upgraded.
+    for warning in ytdlp_warnings(probe_ytdlp(force=True)):
+        print(f"[setup] warning: {warning}", file=sys.stderr)
 
     has_key, backend = _have_api_key()
     if has_key:

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import statistics
 import subprocess
 import sys
 from pathlib import Path
@@ -37,6 +38,47 @@ MAX_READ_DIMENSION = 1998
 DEDUP_THUMB = 16
 DEDUP_THRESHOLD = 2.0
 SHOWINFO_TS_RE = re.compile(r"pts_time:([0-9.]+)")
+
+# Frame width used when the caller doesn't pick one and the source is not a
+# screen recording. Cheap, and plenty for "what happens in this video".
+DEFAULT_RESOLUTION = 512
+# Frame width for a detected screen recording. A 1920-wide UI squeezed to 512
+# renders menu text about three pixels tall — unreadable no matter how good the
+# download was. 1536 is comfortably inside MAX_READ_DIMENSION and, measured on a
+# Google Cloud console capture, is where menu items and small body text become
+# legible. Going higher buys little and costs tokens quadratically.
+SCREEN_RESOLUTION = 1536
+# A 1536px frame carries ~9x the pixels of a 512px one, so the frame cap comes
+# down with it to keep the image-token bill roughly where it was. Only applied
+# when the user did not set --max-frames themselves.
+SCREEN_FRAME_CAP = 40
+# Below this the source has no detail to preserve — _scale_filter never upscales
+# (it takes min(resolution, iw)), so raising the width would change nothing.
+SCREEN_MIN_WIDTH = 1280
+# Screen-recording probe. The signal is FLATNESS — the share of a frame's pixels
+# sitting at one luma value — because a UI is mostly uniform chrome and
+# background, while camera footage is gradients everywhere. Measured on 1080p
+# YouTube clips, median over 6 samples (sliding 2-bucket window):
+#
+#     screen : terminal 0.81, n8n/console 0.76, excel 0.70, vscode 0.67
+#     camera : TED talk 0.23, cooking 0.17, travel vlog 0.12
+#
+# Motion is deliberately NOT used, though it is the intuitive choice. Adjacent
+# frames are near-identical in BOTH classes once YouTube's encoder has denoised
+# them (measured: 0.0-0.14 mean delta for a talking head as well as a
+# screencast), so a motion test reports every video as a screen recording.
+SCREEN_PROBE_WIDTH = 192
+SCREEN_PROBE_HEIGHT = 108
+# 32 buckets of 8 luma levels, scored over a sliding pair of buckets so a
+# uniform background straddling a bucket edge still counts as one region.
+SCREEN_FLAT_BUCKETS = 32
+# Midway between the two measured groups (camera max 0.23, screen min 0.67).
+SCREEN_FLATNESS_THRESHOLD = 0.45
+# Sample points spread across the range; the MEDIAN decides. A mean would be
+# swung by a title card or a fade to black, which are perfectly flat and appear
+# in plenty of camera footage — one such frame is exactly what the TED talk
+# control contributed (single sample 0.77, median 0.23).
+SCREEN_PROBE_POINTS = 6
 
 
 def _scale_filter(resolution: int) -> str:
@@ -159,11 +201,110 @@ def auto_fps_focus(duration_seconds: float, max_frames: int = 100) -> tuple[floa
     return _clamp_fps(target / duration_seconds, duration_seconds, max_frames)
 
 
+def _frame_flatness(frame: bytes) -> float:
+    """Share of pixels in the most populated pair of adjacent luma buckets.
+
+    1.0 means a single flat colour fills the frame; a photographic image spreads
+    across the histogram and lands near zero.
+    """
+    if not frame:
+        return 0.0
+    hist = [0] * SCREEN_FLAT_BUCKETS
+    shift = 8 - SCREEN_FLAT_BUCKETS.bit_length() + 1
+    for pixel in frame:
+        hist[pixel >> shift] += 1
+    best = max(hist[i] + hist[i + 1] for i in range(SCREEN_FLAT_BUCKETS - 1))
+    return best / len(frame)
+
+
+def _probe_flatness(video_path: str, at_seconds: float) -> float | None:
+    """Flatness of one frame at ``at_seconds``, or None if it can't be decoded.
+
+    Fast-seek single-frame decode, downscaled by ffmpeg so we stay pure-stdlib.
+    The scale is deliberately not aspect-preserving: a luma histogram does not
+    care about geometry, and a fixed size keeps the byte count predictable.
+    """
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-ss", f"{max(0.0, at_seconds):.3f}",
+        "-i", str(Path(video_path).resolve()),
+        "-vf", f"scale={SCREEN_PROBE_WIDTH}:{SCREEN_PROBE_HEIGHT},format=gray",
+        "-frames:v", "1",
+        "-f", "rawvideo",
+        "-",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    expected = SCREEN_PROBE_WIDTH * SCREEN_PROBE_HEIGHT
+    if result.returncode != 0 or len(result.stdout) < expected:
+        return None
+    return _frame_flatness(result.stdout[:expected])
+
+
+def detect_screen_recording(
+    video_path: str,
+    meta: dict,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+) -> tuple[bool, dict]:
+    """Decide whether the source is a screen capture rather than camera footage.
+
+    Measured, not guessed: sample frames across the range and take the median
+    flatness (see SCREEN_FLATNESS_THRESHOLD for the numbers this is calibrated
+    against). Aspect ratio is deliberately not part of the test — a 4:3
+    screencast is still a screencast, and 16:9 is just as true of every talking
+    head, so it would only add false negatives.
+
+    Fail-open: any probe trouble returns ``(False, ...)`` and the caller keeps
+    the ordinary default.
+    """
+    width = meta.get("width") or 0
+    evidence: dict = {
+        "width": width,
+        "height": meta.get("height"),
+        "samples": 0,
+        "flatness": None,
+        "reason": "",
+    }
+    if width < SCREEN_MIN_WIDTH:
+        evidence["reason"] = f"source is {width}px wide, below {SCREEN_MIN_WIDTH}"
+        return False, evidence
+
+    lo = start_seconds or 0.0
+    hi = end_seconds if end_seconds is not None else float(meta.get("duration_seconds") or 0.0)
+    span = max(0.0, hi - lo)
+    if span <= 0:
+        evidence["reason"] = "no measurable duration"
+        return False, evidence
+
+    # Sample strictly inside the range: the first and last moments are often a
+    # title card or a fade, which are flat in every kind of video.
+    points = [lo + span * (i + 1) / (SCREEN_PROBE_POINTS + 1) for i in range(SCREEN_PROBE_POINTS)]
+    scores = [s for s in (_probe_flatness(video_path, p) for p in points) if s is not None]
+    if not scores:
+        evidence["reason"] = "frame probe returned nothing"
+        return False, evidence
+
+    flatness = statistics.median(scores)
+    evidence["samples"] = len(scores)
+    evidence["flatness"] = round(flatness, 3)
+    detected = flatness >= SCREEN_FLATNESS_THRESHOLD
+    evidence["reason"] = (
+        f"median flatness {flatness:.2f} across {len(scores)} samples, "
+        f"screen-recording threshold {SCREEN_FLATNESS_THRESHOLD:.2f}"
+    )
+    return detected, evidence
+
+
 def extract(
     video_path: str,
     out_dir: Path,
     fps: float,
-    resolution: int = 512,
+    resolution: int = DEFAULT_RESOLUTION,
     max_frames: int = 100,
     start_seconds: float | None = None,
     end_seconds: float | None = None,
@@ -217,7 +358,7 @@ def extract(
 def extract_scene_candidates(
     video_path: str,
     out_dir: Path,
-    resolution: int = 512,
+    resolution: int = DEFAULT_RESOLUTION,
     max_frames: int | None = 100,
     start_seconds: float | None = None,
     end_seconds: float | None = None,
@@ -325,7 +466,7 @@ def extract_at_timestamps(
     video_path: str,
     out_dir: Path,
     timestamps: list[float],
-    resolution: int = 512,
+    resolution: int = DEFAULT_RESOLUTION,
     max_frames: int | None = None,
     start_seconds: float | None = None,
     end_seconds: float | None = None,
@@ -512,7 +653,7 @@ def extract_scene_or_uniform(
     out_dir: Path,
     fps: float,
     target_frames: int,
-    resolution: int = 512,
+    resolution: int = DEFAULT_RESOLUTION,
     max_frames: int | None = 100,
     start_seconds: float | None = None,
     end_seconds: float | None = None,
@@ -576,7 +717,7 @@ def extract_scene_or_uniform(
 def extract_keyframes(
     video_path: str,
     out_dir: Path,
-    resolution: int = 512,
+    resolution: int = DEFAULT_RESOLUTION,
     max_frames: int | None = 50,
     start_seconds: float | None = None,
     end_seconds: float | None = None,
@@ -696,7 +837,7 @@ if __name__ == "__main__":
     args = sys.argv[3:]
 
     fps_override = None
-    resolution = 512
+    resolution = DEFAULT_RESOLUTION
     max_frames = 100
     start_arg = None
     end_arg = None

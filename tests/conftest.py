@@ -69,6 +69,49 @@ def build_static_clip(
     ])
 
 
+def build_screen_clip(path: Path, duration: float = 4.0, fps: int = 10) -> None:
+    """A flat background with UI-like boxes: high luma flatness, like a screencast.
+
+    1280x720 because detect_screen_recording ignores anything narrower — below
+    that there is no detail for a higher frame width to preserve.
+    """
+    _run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-t", str(duration), "-i", f"color=c=white:s=1280x720:r={fps}",
+        "-vf", (
+            "drawbox=x=40:y=40:w=380:h=560:color=black:t=fill,"
+            "drawbox=x=520:y=80:w=300:h=14:color=gray:t=fill,"
+            "drawbox=x=520:y=140:w=220:h=14:color=gray:t=fill"
+        ),
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        str(path),
+    ])
+
+
+def build_photographic_clip(path: Path, duration: float = 4.0, fps: int = 10) -> None:
+    """Broad luma histogram with motion — stands in for camera footage."""
+    _run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-t", str(duration), "-i", f"testsrc2=s=1280x720:r={fps}",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        str(path),
+    ])
+
+
+@pytest.fixture(scope="session")
+def screen_clip(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    path = tmp_path_factory.mktemp("clips") / "screen.mp4"
+    build_screen_clip(path)
+    return path
+
+
+@pytest.fixture(scope="session")
+def photographic_clip(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    path = tmp_path_factory.mktemp("clips") / "photo.mp4"
+    build_photographic_clip(path)
+    return path
+
+
 @pytest.fixture(scope="session")
 def cut_clip(tmp_path_factory: pytest.TempPathFactory) -> Path:
     path = tmp_path_factory.mktemp("clips") / "cuts.mp4"
