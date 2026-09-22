@@ -59,9 +59,15 @@ YTDLP_LATEST_TTL_SECONDS = 24 * 60 * 60
 YTDLP_PYPI_URL = "https://pypi.org/pypi/yt-dlp/json"
 YTDLP_PYPI_TIMEOUT = 4
 # Probing costs two yt-dlp launches (~0.5s) per candidate, and --check runs on
-# every /watch call, so the answers are cached. Keyed on the candidate paths, so
-# installing or removing a copy re-probes immediately rather than reporting the
-# old answer for a day.
+# every /watch call, so the answers are cached. Keyed on each candidate's path
+# AND its size and mtime, so installing, removing OR upgrading a copy re-probes
+# immediately rather than reporting the old answer for a day.
+#
+# Paths alone were not enough, and the gap was directly in the way of the advice
+# this file gives: the fix we print is `pipx install --force`, which upgrades in
+# place and leaves the path identical. So a user followed the instruction, fixed
+# their install, re-ran /watch, and got the same staleness warning for another
+# 24 hours — which reads exactly like the upgrade having failed.
 YTDLP_PROBE_CACHE = CONFIG_DIR / ".ytdlp-probe.json"
 YTDLP_PROBE_TTL_SECONDS = 24 * 60 * 60
 YTDLP_UPGRADE_COMMAND = "pipx install --force 'yt-dlp[default,curl-cffi]'"
@@ -229,8 +235,24 @@ def _probe_ytdlp_uncached(path: str) -> dict:
     }
 
 
+def _candidate_signature(path: str) -> str:
+    """Path plus what would change if the binary there were replaced.
+
+    stat() follows the symlink, which is what makes this work for pipx: the
+    shim in ~/.local/bin keeps its name while the venv underneath is rewritten.
+    Unreadable stats to a constant so a vanished file simply looks different
+    from a present one rather than raising.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return f"{path}::"
+    return f"{path}:{st.st_mtime_ns}:{st.st_size}"
+
+
 def _probe_all(candidates: list[str], *, force: bool = False) -> dict[str, dict]:
-    """Probe every candidate, reusing a cache keyed on the candidate set."""
+    """Probe every candidate, reusing a cache keyed on the candidate binaries."""
+    signatures = sorted(_candidate_signature(path) for path in candidates)
     cached: dict | None = None
     if not force:
         try:
@@ -240,7 +262,7 @@ def _probe_all(candidates: list[str], *, force: bool = False) -> dict[str, dict]
         if not isinstance(cached, dict):
             cached = None
         elif (
-            sorted(cached.get("probes", {})) != sorted(candidates)
+            cached.get("signatures") != signatures
             or (time.time() - float(cached.get("checked_at") or 0)) > YTDLP_PROBE_TTL_SECONDS
         ):
             cached = None
@@ -252,7 +274,10 @@ def _probe_all(candidates: list[str], *, force: bool = False) -> dict[str, dict]
     try:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         YTDLP_PROBE_CACHE.write_text(
-            json.dumps({"checked_at": time.time(), "probes": probes}), encoding="utf-8"
+            json.dumps(
+                {"checked_at": time.time(), "signatures": signatures, "probes": probes}
+            ),
+            encoding="utf-8",
         )
     except OSError:
         pass

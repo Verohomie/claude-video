@@ -166,6 +166,26 @@ def test_probe_cache_reprobes_when_the_candidate_set_changes(isolated, monkeypat
     assert setup.probe_ytdlp()["path"] == str(pipx / "yt-dlp")
 
 
+def test_probe_cache_reprobes_when_a_copy_is_upgraded_in_place(isolated, monkeypatch):
+    """The case the path-keyed cache missed, and the one our own advice causes.
+
+    `pipx install --force` is what the failure message tells the user to run,
+    and it replaces the binary without changing its path. Keyed on paths alone
+    the cache kept serving the pre-upgrade version for 24h, so a user who did
+    exactly as instructed saw the identical warning and concluded the upgrade
+    had not worked.
+    """
+    local = isolated / "local"
+    _fake_ytdlp(local, "2020.01.01", impersonation=False)
+    monkeypatch.setattr(setup, "ytdlp_extra_dirs", lambda: [local])
+    assert setup.probe_ytdlp()["version"] == "2020.01.01"
+
+    _fake_ytdlp(local, "2026.08.19", impersonation=True)  # same path, new build
+    probe = setup.probe_ytdlp()
+    assert probe["version"] == "2026.08.19"
+    assert probe["impersonation"] is True
+
+
 # ---- the resolved path must actually reach yt-dlp's argv -------------------
 
 def test_download_invokes_the_resolved_binary(isolated, monkeypatch, tmp_path):
