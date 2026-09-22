@@ -11,13 +11,20 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.error import HTTPError
+from urllib.parse import urlencode, urlparse
+from urllib.request import Request, urlopen
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 from config import DEFAULT_QUALITY  # noqa: E402
-from setup import YTDLP_UPGRADE_COMMAND, probe_ytdlp, resolve_ytdlp  # noqa: E402
+from setup import (  # noqa: E402
+    YTDLP_UPGRADE_COMMAND,
+    probe_ytdlp,
+    resolve_ytdlp,
+    ytdlp_warnings,
+)
 
 
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".flv", ".wmv"}
@@ -148,46 +155,65 @@ def format_selector(quality: str = DEFAULT_QUALITY, audio_only: bool = False) ->
 
 
 # Substrings yt-dlp prints for failures a user can actually act on, each mapped
-# to what to do about it. Ordered: the first match wins, so put the specific
-# bot-check signatures ahead of the generic 403.
-_FAILURE_HINTS: list[tuple[tuple[str, ...], str]] = [
+# to a key and to what to do about it. Ordered: the first match wins, so put the
+# specific bot-check signatures ahead of the generic 403.
+#
+# The two refusal cases deliberately state no cause. Whether a refusal means
+# "your tool is stale" or "your address is throttled" cannot be read off the
+# error text at all — both produce the identical message — so the cause is
+# decided later, from the local yt-dlp's measured state. See
+# _refusal_advice.
+_FAILURE_HINTS: list[tuple[str, tuple[str, ...], str]] = [
     (
+        "bot_check",
         ("sign in to confirm you're not a bot", "sign in to confirm youre not a bot",
          "confirm you're not a bot", "only images are available"),
-        "YouTube's bot check refused this download. It usually means your yt-dlp "
-        "is out of date or was built without browser impersonation.",
+        "YouTube's bot check refused this download. Either the local yt-dlp is a "
+        "build it will not accept, or this machine's address is being throttled.",
     ),
     (
+        "forbidden",
         ("http error 403", "403: forbidden", "403 forbidden"),
         "The host returned 403 Forbidden for the video data. Reading titles and "
-        "caption lists still works, which is why this looks confusing — the usual "
-        "cause is an out-of-date yt-dlp that the site no longer accepts.",
+        "caption lists still works, which is why this looks confusing: metadata "
+        "and video data are gated separately.",
     ),
     (
+        "rate_limit",
         ("http error 429", "too many requests"),
         "The host is rate-limiting this machine (HTTP 429). Wait a few minutes "
         "and retry; there is nothing to fix locally.",
     ),
     (
+        "age_restricted",
         ("sign in to confirm your age", "age-restricted", "age restricted"),
-        "This video is age-restricted and needs a signed-in session. Pass "
-        "cookies to yt-dlp, or download it by hand and run /watch on the file.",
+        "This video is age-restricted and needs a signed-in session. Download it "
+        "by hand and run /watch on the file. (Passing your browser's cookies to "
+        "yt-dlp also works, but hands it a live login — see the cookie warning "
+        "in SKILL.md before doing that.)",
     ),
     (
+        "unavailable",
         ("private video", "members-only", "join this channel", "video unavailable"),
         "The host says this video is not publicly available (private, "
         "members-only, or removed). Nothing local will fix it.",
     ),
     (
+        "geo_blocked",
         ("not available in your country", "geo restricted", "geo-restricted"),
         "This video is geo-restricted and the host refused it from this location.",
     ),
     (
+        "no_format",
         ("requested format is not available",),
         "No stream matched the requested quality ceiling. Re-run with "
         "`--quality best` to take whatever the host offers.",
     ),
 ]
+
+# Refusals where the local tool might or might not be the cause, so the message
+# has to measure before it prescribes.
+_REFUSAL_KEYS = {"bot_check", "forbidden"}
 
 _FIX_COMMAND = (
     "pipx install --force 'yt-dlp[default,curl-cffi]'   "
@@ -195,15 +221,141 @@ _FIX_COMMAND = (
 )
 
 
-def diagnose_failure(output: str) -> str | None:
-    """Map yt-dlp's output onto a plain-language cause, or None if unrecognized."""
+def classify_failure(output: str) -> str | None:
+    """Key of the first failure signature present in yt-dlp's output."""
     if not output:
         return None
     haystack = output.lower()
-    for needles, message in _FAILURE_HINTS:
+    for key, needles, _message in _FAILURE_HINTS:
         if any(n in haystack for n in needles):
-            return message
+            return key
     return None
+
+
+def diagnose_failure(output: str) -> str | None:
+    """Map yt-dlp's output onto a plain-language cause, or None if unrecognized."""
+    key = classify_failure(output)
+    if key is None:
+        return None
+    return next(message for k, _needles, message in _FAILURE_HINTS if k == key)
+
+
+_YOUTUBE_HOSTS = {
+    "youtube.com", "www.youtube.com", "m.youtube.com",
+    "music.youtube.com", "youtu.be", "www.youtu.be",
+}
+_OEMBED_URL = "https://www.youtube.com/oembed"
+_OEMBED_TIMEOUT = 6
+
+
+def _is_youtube(url: str) -> bool:
+    try:
+        return urlparse(url).netloc.lower() in _YOUTUBE_HOSTS
+    except ValueError:
+        return False
+
+
+def probe_video_liveness(url: str) -> tuple[str, str | None]:
+    """Is the video itself still there? ``("live"|"gone"|"unknown", detail)``.
+
+    A refused download and a dead video produce indistinguishable output from
+    the download path, which leaves the user unable to tell "wait and try
+    later" from "this will never work". YouTube's oEmbed endpoint answers that
+    question on a different gate to the video stream: it kept returning correct
+    titles throughout a bot-check block that refused every download.
+
+    One request, only on the failure path, only for YouTube, and only to the
+    host the URL already points at. Fail-open to "unknown" — a diagnosis that
+    cannot itself be diagnosed must never replace the real error.
+    """
+    if not _is_youtube(url):
+        return "unknown", None
+    query = urlencode({"url": url, "format": "json"})
+    request = Request(
+        f"{_OEMBED_URL}?{query}",
+        headers={"User-Agent": "claude-video-watch-skill"},
+    )
+    try:
+        with urlopen(request, timeout=_OEMBED_TIMEOUT) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        # 401 private, 403 restricted, 404 removed. 400 is what YouTube returns
+        # for an ID it cannot resolve at all — measured, not assumed: a bad ID
+        # gives 400 where a good one gives 200. Anything else is the endpoint
+        # having its own problem and proves nothing about the video.
+        if exc.code in (400, 401, 403, 404):
+            return "gone", f"oEmbed returned HTTP {exc.code}"
+        return "unknown", None
+    except Exception:
+        return "unknown", None
+    title = payload.get("title")
+    author = payload.get("author_name")
+    if not title:
+        return "unknown", None
+    detail = f'"{title}"' + (f" by {author}" if author else "")
+    return "live", detail
+
+
+def _refusal_advice(url: str, probe: dict) -> list[str]:
+    """What to actually do about a refused download, measured rather than assumed.
+
+    The old advice said a refusal is "almost always an out-of-date yt-dlp". That
+    is true often enough to be worth saying first, and wrong in a way that costs
+    an hour when it is wrong: on 2026-09-22 a current yt-dlp with working
+    impersonation was refused on every player client, every PO-token route and a
+    cookie-less browser profile, because the refusal was per-address throttling
+    and had nothing to do with the tool. Probing harder made it worse — a control
+    video that had just succeeded failed on the next attempt.
+
+    So: if the local install has a known fault, that is the lead. If it does not,
+    say so plainly and tell the user to stop, because attempts are what is being
+    counted.
+    """
+    lines: list[str] = []
+    state, detail = probe_video_liveness(url)
+    if state == "live":
+        lines.append(
+            f"The video itself is fine — YouTube still returns {detail} for it. "
+            "So this is the download being blocked, not a dead or private video."
+        )
+    elif state == "gone":
+        lines.append(
+            f"YouTube will not describe this video either ({detail}), so it is "
+            "most likely private, removed, or the ID is wrong. Nothing local "
+            "will fix that."
+        )
+        return lines
+
+    faults = ytdlp_warnings(probe)
+    if faults:
+        lines.append("")
+        lines.append("Your yt-dlp is the likely cause:")
+        lines.extend(f"  - {fault}" for fault in faults)
+        lines.append("")
+        lines.append("Fix — install a current yt-dlp with impersonation support:")
+        lines.append(f"  {_FIX_COMMAND}")
+        lines.append(
+            "Homebrew's build lags and omits curl_cffi, so its impersonation "
+            "targets all read unavailable. Treat yt-dlp as perishable: sites "
+            "change their defences every few weeks."
+        )
+        return lines
+
+    lines.append("")
+    lines.append(
+        "Your yt-dlp is current and has working browser impersonation, so this "
+        "is NOT the out-of-date-tool case and reinstalling it will change "
+        "nothing. The host is refusing this machine's address."
+    )
+    lines.append("")
+    lines.append(
+        "Do not retry in a loop, and do not sweep player clients: attempts are "
+        "the thing being counted, and probing tightens the block rather than "
+        "getting around it. Wait — tens of minutes at least — and try again "
+        "later. If it is urgent, download the file by hand on another network "
+        "and run /watch on the local file."
+    )
+    return lines
 
 
 def _ytdlp_state_line() -> str | None:
@@ -264,6 +416,7 @@ def _download_failure_message(
     url: str, out_dir: Path, returncode: int, log_tail: str
 ) -> str:
     """Say what went wrong and what to type, instead of only that nothing appeared."""
+    key = classify_failure(log_tail)
     cause = diagnose_failure(log_tail)
     lines = [f"yt-dlp did not produce a video file for {url} (exit {returncode})."]
     if cause:
@@ -272,15 +425,14 @@ def _download_failure_message(
         state = _ytdlp_state_line()
         if state:
             lines.append(state)
-        if "yt-dlp" in cause:
-            lines.append("")
-            lines.append("Fix — install a current yt-dlp with impersonation support:")
-            lines.append(f"  {_FIX_COMMAND}")
-            lines.append(
-                "Homebrew's build lags and omits curl_cffi, so its impersonation "
-                "targets all read unavailable. Treat yt-dlp as perishable: sites "
-                "change their defences every few weeks."
-            )
+        if key in _REFUSAL_KEYS:
+            try:
+                lines.extend(_refusal_advice(url, probe_ytdlp()))
+            except Exception:
+                # Diagnosing a failure must never itself raise and swallow the
+                # error the user actually needs to see.
+                lines.append("")
+                lines.append(f"If yt-dlp is out of date, upgrade it: {_FIX_COMMAND}")
     else:
         lines.append("")
         lines.append(

@@ -27,6 +27,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from urllib.request import Request, urlopen
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -41,7 +42,22 @@ CONFIG_FILE = CONFIG_DIR / ".env"
 # yt-dlp is perishable: sites change their defences every few weeks and yt-dlp
 # answers within days, so a copy older than this is a likely download failure
 # rather than merely a stale one.
+#
+# Age alone is NOT enough to warn on, and treating it that way produced a real
+# false lead: on 2026-09-22 the newest yt-dlp in existence (stable 2026.08.19)
+# was 34 days old, so this threshold fired on an install that was already
+# current. The advice read "you are behind"; the truth was "upstream has not
+# shipped in 34 days". Following it reinstalls the identical version. So the
+# warning is gated on a newer release actually existing — see ytdlp_warnings.
 YTDLP_STALE_DAYS = 30
+# Consulted ONLY when a copy is already older than YTDLP_STALE_DAYS, i.e. only
+# when we would otherwise warn. The common case never touches the network, and
+# the answer is cached for a day either way — including a failure, so an offline
+# machine stalls once rather than on every /watch call.
+YTDLP_LATEST_CACHE = CONFIG_DIR / ".ytdlp-latest.json"
+YTDLP_LATEST_TTL_SECONDS = 24 * 60 * 60
+YTDLP_PYPI_URL = "https://pypi.org/pypi/yt-dlp/json"
+YTDLP_PYPI_TIMEOUT = 4
 # Probing costs two yt-dlp launches (~0.5s) per candidate, and --check runs on
 # every /watch call, so the answers are cached. Keyed on the candidate paths, so
 # installing or removing a copy re-probes immediately rather than reporting the
@@ -291,17 +307,84 @@ def resolve_ytdlp() -> str:
     return probe_ytdlp().get("path") or "yt-dlp"
 
 
+def _fetch_latest_release() -> str | None:
+    """Newest yt-dlp version string on PyPI, or None if it cannot be read.
+
+    Fail-open in every direction: preflight must never be blocked, slowed past
+    the timeout, or crashed by this. A named User-Agent because the stdlib
+    default gets bot-banned by some CDNs.
+    """
+    request = Request(YTDLP_PYPI_URL, headers={"User-Agent": "claude-video-watch-skill"})
+    try:
+        with urlopen(request, timeout=YTDLP_PYPI_TIMEOUT) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return None
+    version = (payload.get("info") or {}).get("version")
+    if isinstance(version, str) and version.strip():
+        return version.strip()
+    return None
+
+
+def latest_ytdlp_release(*, force: bool = False) -> str | None:
+    """The newest yt-dlp release, cached for a day. None when unknown.
+
+    A failed lookup is cached too. Otherwise a machine with no network would
+    pay the full timeout on every single /watch invocation, which is a worse
+    outcome than the stale warning this exists to refine.
+    """
+    if not force:
+        try:
+            cached = json.loads(YTDLP_LATEST_CACHE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            cached = None
+        if isinstance(cached, dict) and (
+            time.time() - float(cached.get("checked_at") or 0)
+        ) <= YTDLP_LATEST_TTL_SECONDS:
+            return cached.get("version")
+
+    version = _fetch_latest_release()
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        YTDLP_LATEST_CACHE.write_text(
+            json.dumps({"checked_at": time.time(), "version": version}), encoding="utf-8"
+        )
+    except OSError:
+        pass
+    return version
+
+
 def ytdlp_warnings(probe: dict) -> list[str]:
-    """Actionable one-liners for a yt-dlp that is likely to fail a download."""
+    """Actionable one-liners for a yt-dlp that is likely to fail a download.
+
+    May annotate ``probe`` with ``latest_release`` when it had to look one up,
+    so the caller can report what the decision was based on without repeating
+    the lookup.
+    """
     if probe.get("path") is None:
         return []
     warnings: list[str] = []
     age = probe.get("age_days")
     if isinstance(age, int) and age > YTDLP_STALE_DAYS:
-        warnings.append(
-            f"yt-dlp {probe.get('version')} is {age} days old. Sites change their "
-            "defences every few weeks, so downloads are likely to be refused."
-        )
+        version = probe.get("version")
+        latest = latest_ytdlp_release()
+        probe["latest_release"] = latest
+        if latest is None:
+            # Could not check. Say so rather than asserting staleness — the
+            # copy may well be the newest one there is.
+            warnings.append(
+                f"yt-dlp {version} is {age} days old, and PyPI could not be "
+                "reached to check for anything newer. It may already be current; "
+                "upgrade only if a download is actually refused."
+            )
+        elif _version_key(version) < _version_key(latest):
+            warnings.append(
+                f"yt-dlp {version} is {age} days old and {latest} is available. "
+                "Sites change their defences every few weeks, so downloads are "
+                "likely to be refused until you upgrade."
+            )
+        # else: old in wall-clock terms but nothing newer exists. Not a fault,
+        # and warning here is what sends the user to reinstall what they have.
     if probe.get("impersonation") is False:
         warnings.append(
             f"yt-dlp at {probe.get('path')} has no browser-impersonation targets "
@@ -317,7 +400,7 @@ def ytdlp_warnings(probe: dict) -> list[str]:
                 f"This is the best of {probe.get('candidates')} yt-dlp copies found; "
                 f"the one running is {probe.get('path')}."
             )
-        warnings.append(f"Fix both with: {YTDLP_UPGRADE_COMMAND}")
+        warnings.append(f"Upgrade with: {YTDLP_UPGRADE_COMMAND}")
     return warnings
 
 

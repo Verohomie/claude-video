@@ -11,6 +11,23 @@ import pytest
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "skills" / "watch" / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
+import download  # noqa: E402
+import setup  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def offline(monkeypatch):
+    """Keep the suite off the network, and off the developer's config dir.
+
+    Two diagnosis paths reach out: the PyPI check that decides whether an old
+    yt-dlp is actually behind anything, and the oEmbed probe that asks whether a
+    refused video still exists. Both are fail-open, so unpinned they would make
+    the suite slow, machine-dependent and quietly different on a plane. Each
+    test that cares about a specific answer re-patches these itself.
+    """
+    monkeypatch.setattr(setup, "latest_ytdlp_release", lambda **kw: None)
+    monkeypatch.setattr(download, "probe_video_liveness", lambda url: ("unknown", None))
+
 # 14 visually distinct fills → 14 abrupt cuts → x264 emits a keyframe per cut.
 COLORS = [
     "red", "green", "blue", "white", "black", "yellow", "cyan",
