@@ -26,6 +26,14 @@ SCENE_THRESHOLD = 0.20
 # this is a low floor — NOT the frame budget — so normal videos with cuts use
 # the (single-pass) scene engine instead of paying for a wasted second decode.
 SCENE_MIN_FRAMES = 8
+# A cut count says nothing about where the cuts ARE. Spacing the detector's own
+# candidates evenly would put one every span/(n+1) seconds; a hole more than this
+# multiple of that means the detector skipped a stretch of the video, and uniform
+# sampling will represent it better. Deliberately generous -- the scene engine
+# puts frames where something changed, so this is a check for "missed a stretch
+# entirely", not for "was sparse". Tightening it trades a real engine for a
+# cheaper one and is the wrong direction; see _covers_range.
+MAX_GAP_RATIO = 4.0
 # Below this many decoded keyframes a clip is too sparse for keyframe coverage
 # (very short or oddly encoded), so the cheap tier falls back to uniform.
 KEYFRAME_MIN = 4
@@ -894,6 +902,34 @@ def _dedupe_by_deltas(
     return kept, len(dropped)
 
 
+def _worst_gap(times: list[float], start: float, end: float) -> float:
+    """Longest stretch of ``start``-``end`` containing no candidate, edges included."""
+    if end <= start:
+        return 0.0
+    marks = [start, *sorted(times), end]
+    return max(b - a for a, b in zip(marks, marks[1:]))
+
+
+def _covers_range(times: list[float], start: float, end: float) -> bool:
+    """True when candidates are spread across the range rather than bunched up.
+
+    The test is clustering, NOT density. Whatever the detector found, spacing
+    those same candidates evenly would put one every ``span / (n + 1)`` seconds;
+    a hole more than ``MAX_GAP_RATIO`` times that means the frames skip a stretch
+    of the video no matter how the budget is later spent.
+
+    Judging against the frame *budget* instead would demand that scene detection
+    return as many cuts as the cap, which is just a slower way of never using the
+    scene engine -- and the scene engine is the one that puts frames where
+    something actually changed. Hence a generous multiple: this is a check for
+    "the detector missed a stretch entirely", not for "the detector was sparse".
+    """
+    if not times or end <= start:
+        return True
+    ideal = (end - start) / (len(times) + 1)
+    return _worst_gap(times, start, end) <= ideal * MAX_GAP_RATIO
+
+
 def extract_scene_or_uniform(
     video_path: str,
     out_dir: Path,
@@ -904,9 +940,10 @@ def extract_scene_or_uniform(
     start_seconds: float | None = None,
     end_seconds: float | None = None,
     dedup: bool = True,
+    span_seconds: float | None = None,
 ) -> tuple[list[dict], dict]:
-    """Prefer scene selection, falling back to uniform only when the video is
-    effectively static (fewer than ``SCENE_MIN_FRAMES`` detected shots).
+    """Prefer scene selection, falling back to uniform when the detector's cuts
+    are too few (``SCENE_MIN_FRAMES``) or too bunched (:func:`_covers_range`).
 
     Scene cuts are detected across the *whole* range (uncapped), near-identical
     frames are dropped (:func:`dedupe_perceptual`, unless ``dedup`` is False),
@@ -926,7 +963,17 @@ def extract_scene_or_uniform(
         end_seconds=end_seconds,
     )
     scene_count = len(scene_frames)
-    if scene_count >= SCENE_MIN_FRAMES:
+
+    # Clearing SCENE_MIN_FRAMES says nothing about coverage: 8 cuts inside a busy
+    # title sequence pass the floor, and the run then reports engine "scene" while
+    # showing ten seconds of an hour. _even_sample always keeps the first and last
+    # candidate, so a span check passes too -- the hole is in the middle.
+    eff_start = start_seconds or 0.0
+    span = _range_span(video_path, start_seconds, end_seconds, span_seconds)
+    eff_end = eff_start + span
+    covered = _covers_range([fr["timestamp_seconds"] for fr in scene_frames], eff_start, eff_end)
+
+    if scene_count >= SCENE_MIN_FRAMES and covered:
         deduped, n_dropped = dedupe_perceptual(scene_frames) if dedup else (scene_frames, 0)
         cap = len(deduped) if max_frames is None else max_frames
         selected = _even_sample(deduped, cap)
@@ -938,6 +985,15 @@ def extract_scene_or_uniform(
             "fallback": False,
         }
 
+    fallback_reason = "sparse" if scene_count < SCENE_MIN_FRAMES else "coverage"
+    if fallback_reason == "coverage":
+        print(
+            f"[watch] {scene_count} scene cuts found but they leave a "
+            f"{_worst_gap([fr['timestamp_seconds'] for fr in scene_frames], eff_start, eff_end):.0f}s "
+            "stretch with no frame — sampling uniformly instead so the whole range is covered",
+            file=sys.stderr,
+        )
+
     fallback_cap = target_frames if max_frames is None else min(max_frames, target_frames)
     frames = extract(
         video_path,
@@ -947,15 +1003,22 @@ def extract_scene_or_uniform(
         max_frames=fallback_cap,
         start_seconds=start_seconds,
         end_seconds=end_seconds,
+        span_seconds=span or None,
     )
     n_dropped = 0
     if dedup:
         frames, n_dropped = dedupe_perceptual(frames)
     return frames, {
         "engine": "uniform",
-        "candidate_count": scene_count,
+        # The uniform frames are the candidates here. Reporting the REJECTED
+        # detector's count made "12 selected from 3 candidates" printable, which
+        # teaches the reader to skip the line rather than trust it.
+        "candidate_count": len(frames) + n_dropped,
         "deduped_count": n_dropped,
         "selected_count": len(frames),
+        "fallback_from": "scene",
+        "fallback_reason": fallback_reason,
+        "fallback_candidate_count": scene_count,
         "fallback": True,
     }
 
@@ -1050,9 +1113,15 @@ def extract_keyframes(
             frames_out, n_dropped = dedupe_perceptual(frames_out)
         return frames_out, {
             "engine": "uniform",
-            "candidate_count": len(candidates),
+            # As in extract_scene_or_uniform: the uniform frames are the
+            # candidates now. len(candidates) is the count the REJECTED keyframe
+            # detector produced, which made selected > candidates printable.
+            "candidate_count": len(frames_out) + n_dropped,
             "deduped_count": n_dropped,
             "selected_count": len(frames_out),
+            "fallback_from": "keyframe",
+            "fallback_reason": "sparse",
+            "fallback_candidate_count": len(candidates),
             "fallback": True,
         }
 

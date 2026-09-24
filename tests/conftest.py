@@ -93,6 +93,34 @@ def build_equal_luma_cut_clip(path: Path, seg: float = 1.0, fps: int = 5) -> Non
     ])
 
 
+def build_clustered_cut_clip(
+    path: Path, n_cuts: int = 9, seg: float = 0.35, tail: float = 34.0, fps: int = 5
+) -> None:
+    """A burst of cuts up front, then a long unchanging tail.
+
+    The shape of the real failure: a title sequence or cold open clears
+    SCENE_MIN_FRAMES on its own, so the scene engine "succeeds" and the run
+    reports coverage of a video it has only seen the first seconds of. Total
+    length is dominated by the tail, so the worst gap is enormous relative to the
+    spacing the cuts imply.
+    """
+    inputs: list[str] = []
+    for i in range(n_cuts):
+        color = COLORS[i % len(COLORS)]
+        inputs += ["-f", "lavfi", "-t", str(seg), "-i", f"color=c={color}:s=320x240:r={fps}"]
+    inputs += ["-f", "lavfi", "-t", str(tail), "-i", f"color=c=black:s=320x240:r={fps}"]
+    total = n_cuts + 1
+    streams = "".join(f"[{i}:v]" for i in range(total))
+    _run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        *inputs,
+        "-filter_complex", f"{streams}concat=n={total}:v=1:a=0[out]", "-map", "[out]",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-force_key_frames", f"expr:gte(t,n_forced*{seg})",
+        str(path),
+    ])
+
+
 def build_static_clip(
     path: Path,
     duration: float = 3.0,
@@ -226,6 +254,13 @@ def long_cut_clip(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """
     path = tmp_path_factory.mktemp("clips") / "long_cuts.mp4"
     build_cut_clip(path, n=14, seg=3.0, size="320x240", fps=5)
+    return path
+
+
+@pytest.fixture(scope="session")
+def clustered_cut_clip(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    path = tmp_path_factory.mktemp("clips") / "clustered.mp4"
+    build_clustered_cut_clip(path)
     return path
 
 

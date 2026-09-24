@@ -345,6 +345,9 @@ def main() -> int:
                 start_seconds=start_sec,
                 end_seconds=end_sec,
                 dedup=not args.no_dedup,
+                # Already probed for the metadata block above; passing it keeps
+                # the coverage check and the fps clamp from re-running ffprobe.
+                span_seconds=effective_duration,
             )
 
     if cue_frames:
@@ -416,7 +419,19 @@ def main() -> int:
     if detail != "transcript":
         cap_label = "unlimited" if detail_budget is None else str(detail_budget)
         engine = frame_meta.get("engine", "scene")
-        fallback = " with uniform fallback" if frame_meta.get("fallback") else ""
+        # Say WHY it fell back. "sparse" means the detector found almost no cuts;
+        # "coverage" means it found enough but left a stretch of the video with no
+        # frame at all — a different thing to know when reading the answer.
+        reason = frame_meta.get("fallback_reason")
+        if frame_meta.get("fallback") and reason == "coverage":
+            rejected = frame_meta.get("fallback_candidate_count")
+            fallback = f" — fell back from scene: {rejected} cuts left a gap in the range"
+        elif frame_meta.get("fallback") and reason == "sparse":
+            fallback = " — fell back from scene: too few cuts to cover the range"
+        elif frame_meta.get("fallback"):
+            fallback = " with uniform fallback"
+        else:
+            fallback = ""
         deduped = frame_meta.get("deduped_count", 0)
         dedup_note = f", {deduped} near-duplicate{'s' if deduped != 1 else ''} dropped" if deduped else ""
         print(
