@@ -192,3 +192,26 @@ def static_clip(tmp_path_factory: pytest.TempPathFactory) -> Path:
     path = tmp_path_factory.mktemp("clips") / "static.mp4"
     build_static_clip(path)
     return path
+
+
+@pytest.fixture(scope="session")
+def long_cut_clip(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """~42s with 14 distinct shots, for tests about coverage across a range.
+
+    The other clips are a few seconds long, which cannot tell "sampled the head"
+    apart from "spread across the whole thing" -- those two only diverge once
+    there is real duration between the first frame and the last.
+    """
+    path = tmp_path_factory.mktemp("clips") / "long_cuts.mp4"
+    build_cut_clip(path, n=14, seg=3.0, size="320x240", fps=5)
+    return path
+
+
+@pytest.fixture(scope="session")
+def long_static_clip(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """~42s of one colour: long enough to measure coverage, and with too few
+    scene changes to clear SCENE_MIN_FRAMES -- so it takes the uniform fallback,
+    which is the path a screen recording takes."""
+    path = tmp_path_factory.mktemp("clips") / "long_static.mp4"
+    build_static_clip(path, duration=42.0, fps=5)
+    return path

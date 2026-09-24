@@ -397,6 +397,30 @@ def detect_screen_recording(
     return detected, evidence
 
 
+def _range_span(
+    video_path: str,
+    start_seconds: float | None,
+    end_seconds: float | None,
+    span_seconds: float | None = None,
+) -> float:
+    """Length in seconds of the range being extracted, or 0.0 if unknowable.
+
+    Prefers what the caller already knows over another ffprobe: an explicit
+    span, then an explicit --end, and only otherwise the container duration.
+    Fails open at 0.0 -- every use of this is an optimisation, so a probe that
+    cannot answer must never take down a run that would otherwise work.
+    """
+    start = start_seconds or 0.0
+    if span_seconds is not None:
+        return max(0.0, span_seconds)
+    if end_seconds is not None:
+        return max(0.0, end_seconds - start)
+    try:
+        return max(0.0, float(get_metadata(video_path)["duration_seconds"]) - start)
+    except (SystemExit, OSError, KeyError, TypeError, ValueError):
+        return 0.0
+
+
 def extract(
     video_path: str,
     out_dir: Path,
@@ -405,9 +429,40 @@ def extract(
     max_frames: int = 100,
     start_seconds: float | None = None,
     end_seconds: float | None = None,
+    span_seconds: float | None = None,
 ) -> list[dict]:
     if shutil.which("ffmpeg") is None:
         raise SystemExit("ffmpeg is not installed. Install with: brew install ffmpeg")
+
+    # `fps` sets how densely we sample; `max_frames` is a hard stop. They are not
+    # the same kind of limit: the fps filter emits evenly across the input, but
+    # -frames:v just makes ffmpeg QUIT once it has that many. So when the two
+    # disagree -- fps * span > max_frames -- sampling at the requested rate
+    # captures only the HEAD of the range and the tail is never looked at, with
+    # no error and no warning.
+    #
+    # auto_fps() can't cause this (it divides an already-capped target by the
+    # duration), but two real paths do: an explicit --fps, and a cap that shrank
+    # after fps was chosen -- --timestamps spends part of the budget on pinned
+    # cue frames (watch.py), so the detail engine is left with fewer frames than
+    # the rate assumes. Measured before this guard: --fps 2 on a 5-minute video
+    # covered 50s of 300s; a screen recording with 30 cues covered 75s of 300s.
+    #
+    # Lower the rate to fit the budget rather than honour a rate that silently
+    # truncates: a frame set that spans the video is what every caller is
+    # actually asking for, and the synthesized timestamps below stay honest only
+    # while fps matches what ffmpeg was told to do.
+    if max_frames is not None and max_frames > 0 and fps > 0:
+        span = _range_span(video_path, start_seconds, end_seconds, span_seconds)
+        if span > 0 and fps * span > max_frames:
+            covered = max_frames / fps
+            fps = max_frames / span
+            print(
+                f"[watch] {max_frames} frames at the requested rate would cover only "
+                f"{covered:.0f}s of {span:.0f}s; sampling at {fps:.4g} fps instead so they "
+                "spread across the whole range",
+                file=sys.stderr,
+            )
 
     out_dir.mkdir(parents=True, exist_ok=True)
     for existing in out_dir.glob("frame_*.jpg"):
@@ -893,6 +948,8 @@ def extract_keyframes(
             max_frames=budget,
             start_seconds=start_seconds,
             end_seconds=end_seconds,
+            # Already probed just above -- don't make extract() do it again.
+            span_seconds=eff_duration,
         )
         n_dropped = 0
         if dedup:
