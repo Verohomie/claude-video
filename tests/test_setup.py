@@ -10,30 +10,62 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import pytest
+
 SETUP = Path(__file__).resolve().parent.parent / "skills" / "watch" / "scripts" / "setup.py"
 
 
-def _seed_ytdlp_probe(home: Path, *, version=None, impersonation=True) -> None:
-    """Pin the cached yt-dlp probe under a temp HOME.
+def _seed_ytdlp_probe(home: Path, *, version=None, impersonation=True, latest=None) -> None:
+    """Pin the cached yt-dlp probe, and the release check, under a temp HOME.
 
-    Preflight warns about a stale or impersonation-less yt-dlp, so without this
-    every assertion about setup's output would depend on which yt-dlp copies the
-    developer happens to have installed. The cache is keyed on the exact
-    candidate set, which depends on PATH and on HOME, so the seed is written by
-    setup.py itself under the same environment rather than guessed at here.
+    Preflight warns about a yt-dlp that is behind or built without
+    impersonation, so without this every assertion about setup's output would
+    depend on which copies the developer happens to have installed. The probe
+    cache is keyed on the candidate binaries — which depend on PATH and HOME —
+    so the seed is written by setup.py itself under the same environment rather
+    than guessed at here.
+
+    ``signatures`` is not optional: the cache is validated against it, and a
+    seed that omits it is silently discarded in favour of a real probe of the
+    developer's machine. That is not a hypothetical — it happened when the
+    signature check was added, and every test in this file quietly started
+    measuring this Mac while still passing. test_a_seeded_probe_reaches_setup
+    is the guard against it recurring.
+
+    ``latest`` pins what the staleness check believes the newest release is,
+    which keeps the suite off the network. These run setup.py in a subprocess,
+    so conftest's ``offline`` fixture cannot reach them — it patches the
+    in-process module only. Defaults to the seeded version, i.e. "nothing newer
+    exists", which is the no-warning case.
+
+    PATH is deliberately NOT scrubbed here or in _run. Emptying it would make
+    the ffmpeg/ffprobe lookups report those as missing and change what these
+    tests measure; pinning the cache is what makes the yt-dlp answer
+    deterministic, and it does so whatever PATH contains.
     """
     version = version or datetime.now().strftime("%Y.%m.%d")
+    params = json.dumps({
+        "version": version,
+        "impersonation": impersonation,
+        "latest": latest or version,
+    })
     snippet = (
         "import json, sys, time\n"
         f"sys.path.insert(0, {str(SETUP.parent)!r})\n"
         "import setup\n"
+        f"p = json.loads({params!r})\n"
         "cands = setup.ytdlp_candidates()\n"
-        "probes = {p: {'path': p, 'version': %r, 'impersonation': %r,\n"
-        "              'checked_at': time.time()} for p in cands}\n"
+        "probes = {c: {'path': c, 'version': p['version'],\n"
+        "              'impersonation': p['impersonation'],\n"
+        "              'checked_at': time.time()} for c in cands}\n"
+        "sigs = sorted(setup._candidate_signature(c) for c in cands)\n"
         "setup.CONFIG_DIR.mkdir(parents=True, exist_ok=True)\n"
-        "setup.YTDLP_PROBE_CACHE.write_text(\n"
-        "    json.dumps({'checked_at': time.time(), 'probes': probes}), encoding='utf-8')\n"
-    ) % (version, impersonation)
+        "setup.YTDLP_PROBE_CACHE.write_text(json.dumps(\n"
+        "    {'checked_at': time.time(), 'signatures': sigs, 'probes': probes}),\n"
+        "    encoding='utf-8')\n"
+        "setup.YTDLP_LATEST_CACHE.write_text(json.dumps(\n"
+        "    {'checked_at': time.time(), 'version': p['latest']}), encoding='utf-8')\n"
+    )
     env = dict(os.environ)
     env["HOME"] = str(home)
     env["USERPROFILE"] = str(home)
@@ -67,6 +99,30 @@ def _write_env(home: Path, body: str) -> None:
     f = cfg / ".env"
     f.write_text(body, encoding="utf-8")
     f.chmod(0o600)
+
+
+def test_a_seeded_probe_reaches_setup(tmp_path):
+    """The seed must actually be used — silence here means it is being ignored.
+
+    Every other test in this file assumes the seeded yt-dlp is what setup sees.
+    When that stopped being true the suite did not fail; it kept passing while
+    measuring the developer's own install, and the next assertion about warning
+    output would have failed only on somebody else's machine. So one test
+    seeds a deliberately broken yt-dlp and demands the complaint.
+    """
+    _write_env(tmp_path, "GROQ_API_KEY=\nOPENAI_API_KEY=\nSETUP_COMPLETE=true\n")
+    probed = json.loads(_run(["--json"], home=tmp_path, seed_probe=False).stdout)
+    if probed["ytdlp"]["path"] is None:
+        pytest.skip("no yt-dlp installed, so there is no candidate to describe")
+
+    _seed_ytdlp_probe(
+        tmp_path, version="2020.01.01", impersonation=False, latest="2099.12.31",
+    )
+    chk = _run(["--check"], home=tmp_path, seed_probe=False)
+    assert "2020.01.01" in chk.stderr, (
+        "seeded probe was discarded; setup re-probed the real machine instead"
+    )
+    assert "impersonation" in chk.stderr
 
 
 def test_json_reports_watch_detail(tmp_path):
