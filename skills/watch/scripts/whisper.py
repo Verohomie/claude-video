@@ -348,17 +348,29 @@ def shift_segments(segments: list[dict], offset_seconds: float) -> list[dict]:
 
 
 def _segments_from_response(data: dict) -> list[dict]:
-    """Convert Whisper verbose_json into our {start, end, text} segment format."""
+    """Convert Whisper verbose_json into our {start, end, text} segment format.
+
+    Keeps Whisper's own per-segment confidence fields alongside the text. They
+    are the only evidence available for telling invented dialogue from real
+    speech, and discarding them here is what made a hallucination arrive looking
+    exactly like a transcript. Downstream consumers read start/end/text and
+    ignore the rest.
+    """
     out: list[dict] = []
     for seg in data.get("segments") or []:
         text = (seg.get("text") or "").strip()
         if not text:
             continue
-        out.append({
+        entry = {
             "start": round(float(seg.get("start") or 0.0), 2),
             "end": round(float(seg.get("end") or 0.0), 2),
             "text": text,
-        })
+        }
+        for field in ("no_speech_prob", "avg_logprob"):
+            value = seg.get(field)
+            if isinstance(value, (int, float)):
+                entry[field] = float(value)
+        out.append(entry)
 
     if not out:
         full = (data.get("text") or "").strip()
@@ -366,6 +378,80 @@ def _segments_from_response(data: dict) -> list[dict]:
             out.append({"start": 0.0, "end": 0.0, "text": full})
 
     return out
+
+
+# Whisper transcribes whatever it is given. Handed music, applause or silence it
+# does not return nothing -- it returns fluent, plausible, entirely invented
+# dialogue, formatted exactly like real speech. These thresholds are Whisper's
+# own signals, not guesses about content:
+#
+#   no_speech_prob  the model's estimate that a segment contains no speech at
+#                   all. 0.6 is the value OpenAI's own decoder uses to decide a
+#                   segment is silence.
+#   avg_logprob     mean token log-probability. Below -1.0 is OpenAI's own
+#                   "decoding failed, fall back" threshold.
+#   repetition      a phrase looping is the signature of the model running away
+#                   on non-speech audio. Measured as a share of the transcript's
+#                   TEXT, not of its segment count: real speech is full of
+#                   repeated short interjections ("right", "okay", "yeah") and
+#                   counting segments flags an ordinary tutorial where one filler
+#                   word happens to land in half the rows. The same three
+#                   "right"s are a sixth of the words and a hallucinated "thank
+#                   you" loop is nearly all of them.
+#
+# Deliberately a caution, never a suppression: a flagged transcript is still
+# shown, because the frames are what settle it and a wrongly-hidden transcript
+# is worse than a correctly-doubted one.
+NO_SPEECH_PROB_LIMIT = 0.6
+NO_SPEECH_SHARE_LIMIT = 0.5
+AVG_LOGPROB_LIMIT = -1.0
+REPEAT_SHARE_LIMIT = 0.5
+REPEAT_MIN_COUNT = 3
+
+
+def _normalise(text: str) -> str:
+    return " ".join(ch for ch in text.lower().strip() if ch.isalnum() or ch.isspace()).strip()
+
+
+def assess_speech(segments: list[dict]) -> dict:
+    """Judge whether a Whisper transcript looks invented rather than heard.
+
+    Returns ``{"suspect": bool, "reasons": [str, ...]}``. Absent confidence
+    fields simply do not vote -- caption transcripts and local backends that omit
+    them come back unflagged rather than falsely accused.
+    """
+    reasons: list[str] = []
+    if not segments:
+        return {"suspect": False, "reasons": reasons}
+
+    scored = [s for s in segments if "no_speech_prob" in s]
+    if scored:
+        silent = sum(1 for s in scored if s["no_speech_prob"] > NO_SPEECH_PROB_LIMIT)
+        share = silent / len(scored)
+        if share > NO_SPEECH_SHARE_LIMIT:
+            reasons.append(
+                f"{share:.0%} of segments are marked as probably-not-speech by the model"
+            )
+
+    logprobs = [s["avg_logprob"] for s in segments if "avg_logprob" in s]
+    if logprobs and (sum(logprobs) / len(logprobs)) < AVG_LOGPROB_LIMIT:
+        reasons.append("average token confidence is below the decoder's own failure threshold")
+
+    texts = [_normalise(s.get("text", "")) for s in segments]
+    texts = [t for t in texts if t]
+    if texts:
+        counts: dict[str, int] = {}
+        for t in texts:
+            counts[t] = counts.get(t, 0) + 1
+        phrase, count = max(counts.items(), key=lambda kv: (kv[1] * len(kv[0]), kv[1]))
+        total_chars = sum(len(t) for t in texts)
+        share = (count * len(phrase) / total_chars) if total_chars else 0.0
+        if count >= REPEAT_MIN_COUNT and share > REPEAT_SHARE_LIMIT:
+            reasons.append(
+                f'the phrase "{phrase[:40]}" is {share:.0%} of the transcript text'
+            )
+
+    return {"suspect": bool(reasons), "reasons": reasons}
 
 
 def transcribe_chunks(
