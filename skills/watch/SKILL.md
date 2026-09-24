@@ -215,6 +215,15 @@ python3 "${SKILL_DIR}/scripts/watch.py" "$URL" --start 1:12:00
 - **Frames** — what's on screen at each timestamp
 - **Transcript** — what's said at each timestamp. The report's header shows the source (`captions` = yt-dlp pulled native subs; `whisper (groq)` or `whisper (openai)` = transcribed by API).
 
+**Proper nouns in a transcript are unverified.** Captions and Whisper both transcribe phonetically, so names come back wrong or invented — a person's name as a plausible-sounding different name, a product as a near-homophone, an acronym expanded incorrectly. Frames are the corrective: title cards, slides, on-screen UI and lower thirds usually spell a name correctly, so check a name against a frame before stating it. Where no frame confirms it — including every `transcript`-detail run, which has no frames at all — give the name as heard and say it came from the transcript and is unverified. This applies to people, companies, products, model names, URLs, prices and figures: anything the user might repeat, quote, or act on.
+
+**Read the Frames line before you characterise coverage.** Three cases change what you can honestly claim:
+- `N near-duplicates dropped` — **the last frame's timestamp is not where the video stops being covered.** Duplicates are dropped because nothing changed, so a frame at 3:45 in a 40-minute video can be standing for the whole unchanging stretch after it. Sampling ran across the full range; what you are holding is the set of moments that *differ*. So "the last frame is at 3:45" does not mean "I only saw the first 3:45" — say the screen was unchanged from 3:45 onward, which is what it actually means, and do not report the tail as unseen.
+- `fell back from scene: N cuts left a gap in the range` — scene detection found cuts but they were bunched, so frames were sampled uniformly instead. Coverage is even; you are not seeing every cut.
+- A `[watch]` line on stderr saying the sampling rate was lowered so frames *spread across the whole range* — the normal, correct outcome. No caveat needed.
+
+Never describe a stretch of the video that no frame and no transcript line covers. Where you are inferring rather than looking, say so.
+
 If the user asked a specific question, answer it directly citing timestamps. If they didn't ask anything, summarize what happens in the video — structure, key moments, notable visuals, spoken content.
 
 This holds for `transcript` detail too: even with no frames, produce a **summary** like the other modes — do not paste the full transcript into chat. Synthesize structure, key moments, and spoken content with timestamps; quote only the lines that matter. Offer the raw transcript only if the user explicitly asks for it.
