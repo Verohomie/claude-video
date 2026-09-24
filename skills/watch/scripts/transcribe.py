@@ -6,19 +6,30 @@ scrolls). We dedupe consecutive identical cues and merge their time ranges.
 """
 from __future__ import annotations
 
+import html
 import re
 import sys
 from pathlib import Path
 
 
-TS_RE = re.compile(
-    r"(\d{2}):(\d{2}):(\d{2})[.,](\d{3})\s+-->\s+(\d{2}):(\d{2}):(\d{2})[.,](\d{3})"
-)
+# WebVTT makes the hours field OPTIONAL: "01:02.500" is as legal as
+# "00:01:02.500", and the spec allows more than two hour digits for very long
+# media. Requiring HH: parsed such a file to zero cues and the run reported "no
+# transcript" -- silently, since nothing distinguishes "no captions" from "a
+# caption file we could not read". YouTube always writes HH:MM:SS, so this was
+# latent rather than biting.
+_STAMP = r"(?:\d{2,}:)?\d{2}:\d{2}[.,]\d{3}"
+TS_RE = re.compile(rf"({_STAMP})\s*-->\s*({_STAMP})")
 TAG_RE = re.compile(r"<[^>]+>")
 
 
-def _to_seconds(h: str, m: str, s: str, ms: str) -> float:
-    return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000.0
+def _to_seconds(stamp: str) -> float:
+    """Seconds from a WebVTT/SRT timestamp, with or without an hours field."""
+    parts = stamp.replace(",", ".").split(":")
+    seconds = float(parts[-1])
+    minutes = int(parts[-2])
+    hours = int(parts[-3]) if len(parts) > 2 else 0
+    return hours * 3600 + minutes * 60 + seconds
 
 
 def parse_vtt(path: str) -> list[dict]:
@@ -33,13 +44,18 @@ def parse_vtt(path: str) -> list[dict]:
             i += 1
             continue
 
-        start = _to_seconds(*match.groups()[:4])
-        end = _to_seconds(*match.groups()[4:])
+        start = _to_seconds(match.group(1))
+        end = _to_seconds(match.group(2))
         i += 1
 
         cue_lines: list[str] = []
         while i < len(lines) and lines[i].strip():
-            cleaned = TAG_RE.sub("", lines[i]).strip()
+            # Strip cue tags FIRST, then unescape -- in that order an escaped
+            # "&lt;b&gt;" survives as the literal text "<b>" the caption author
+            # wrote, instead of turning into a tag and being deleted. Without the
+            # unescape, ">>" speaker markers arrive as "&gt;&gt;" and "&amp;" /
+            # "&#39;" reach the model raw.
+            cleaned = html.unescape(TAG_RE.sub("", lines[i])).strip()
             if cleaned:
                 cue_lines.append(cleaned)
             i += 1
@@ -81,10 +97,19 @@ def filter_range(
 
 
 def format_transcript(segments: list[dict]) -> str:
+    """Render segments as "[MM:SS] text", rolling over to "[H:MM:SS]".
+
+    Without the hours rollover, minutes just kept counting: 1h10m05s rendered as
+    "[70:05]", so every citation in a long video was unreadable and could not be
+    matched against a frame timestamp. Same shape as frames.format_time, so the
+    two halves of the report agree.
+    """
     lines = []
     for seg in segments:
-        start = int(seg["start"])
-        stamp = f"[{start // 60:02d}:{start % 60:02d}]"
+        total = int(seg["start"])
+        hours, rem = divmod(total, 3600)
+        minutes, sec = divmod(rem, 60)
+        stamp = f"[{hours}:{minutes:02d}:{sec:02d}]" if hours else f"[{minutes:02d}:{sec:02d}]"
         lines.append(f"{stamp} {seg['text']}")
     return "\n".join(lines)
 
