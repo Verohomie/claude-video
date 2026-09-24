@@ -622,12 +622,54 @@ def _even_indices(count: int, n: int) -> list[int]:
     """Indices of ``n`` evenly-spaced items out of ``count`` (first + last kept).
 
     ``n >= count`` returns every index; ``n == 1`` returns just the first.
+
+    Spaces by POSITION IN THE LIST, which is only the right answer when the
+    candidates are themselves evenly spread in time. Prefer
+    :func:`_even_time_indices`; this remains for degenerate timelines.
     """
     if n >= count:
         return list(range(count))
     if n <= 1:
         return [0]
     return [round(i * (count - 1) / (n - 1)) for i in range(n)]
+
+
+def _even_time_indices(times: list[float], n: int) -> list[int]:
+    """Indices of ``n`` candidates spread evenly over the TIMELINE.
+
+    First and last are always kept; each interior slot takes the candidate
+    nearest its evenly-spaced target time, and no candidate is taken twice.
+
+    Spacing by list position hands a cluster its share of the budget: 36 cuts
+    packed into 6% of a video keep roughly 90% of the slots, and the other 94% of
+    the runtime shares what is left. A montage, a title sequence or a fast
+    dialogue exchange is enough to cause it, and the result is a frame set that
+    technically spans the video while showing almost none of it. Spacing by
+    timestamp gives every stretch of runtime the same claim on a frame.
+
+    Degenerate timelines -- all one instant, or non-monotonic -- fall back to
+    index spacing, which is what the old behaviour was everywhere.
+    """
+    count = len(times)
+    if n >= count:
+        return list(range(count))
+    if n <= 1:
+        return [0]
+
+    span = times[-1] - times[0]
+    if span <= 0:
+        return _even_indices(count, n)
+
+    chosen = {0, count - 1}
+    for i in range(1, n - 1):
+        target = times[0] + span * i / (n - 1)
+        remaining = [j for j in range(1, count - 1) if j not in chosen]
+        if not remaining:
+            break
+        # Nearest candidate to the target time; index breaks ties so the choice
+        # is deterministic rather than dependent on dict ordering.
+        chosen.add(min(remaining, key=lambda j: (abs(times[j] - target), j)))
+    return sorted(chosen)
 
 
 def parse_timestamps(value: str | None) -> list[float]:
@@ -735,8 +777,14 @@ def _even_sample(candidates: list[dict], n: int) -> list[dict]:
     Shared by every capped engine so all detail modes sample the same way:
     detect all candidates across the full range, then thin down to the cap.
     ``n >= len(candidates)`` keeps everything (the uncapped / under-cap case).
+
+    Spacing is by TIMESTAMP, not list position -- see :func:`_even_time_indices`
+    for why that distinction decides whether a clustered stretch eats the budget.
     """
-    selected = [candidates[i] for i in _even_indices(len(candidates), n)]
+    times = [c.get("timestamp_seconds") for c in candidates]
+    monotonic = all(isinstance(t, (int, float)) for t in times) and times == sorted(times)
+    indices = _even_time_indices(times, n) if monotonic else _even_indices(len(candidates), n)
+    selected = [candidates[i] for i in indices]
 
     keep_paths = {sel["path"] for sel in selected}
     for cand in candidates:
