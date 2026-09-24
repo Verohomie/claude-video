@@ -156,6 +156,7 @@ def main() -> int:
     config = get_config()
     detail = args.detail or str(config["detail"])
     quality = args.quality or str(config["quality"])
+    max_fps = float(config["max_fps"])
     configured_cap = frame_cap(detail)
     if args.max_frames is not None:
         max_frames = args.max_frames
@@ -221,8 +222,23 @@ def main() -> int:
         "height": None,
         "codec": None,
         "has_audio": False,
+        "has_video": False,
     }
     full_duration = meta["duration_seconds"]
+
+    # An audio-only source (a local .mp3/.m4a, or a download that only produced
+    # audio) has nothing to extract frames from. Say so once and carry on in
+    # transcript-only mode: the audio is still worth transcribing, and dying here
+    # would throw away a download that already succeeded.
+    if video_path and not meta.get("has_video", True):
+        print(
+            "[watch] no video stream in this source — continuing transcript-only",
+            file=sys.stderr,
+        )
+        audio_source = video_path
+        video_path = None
+    else:
+        audio_source = video_path
 
     start_sec = parse_time(args.start)
     end_sec = parse_time(args.end)
@@ -276,11 +292,18 @@ def main() -> int:
                 budget_cap = capped
 
     if focused:
-        fps, target = auto_fps_focus(effective_duration, max_frames=budget_cap)
+        fps, target = auto_fps_focus(effective_duration, max_frames=budget_cap, max_fps=max_fps)
     else:
-        fps, target = auto_fps(effective_duration, max_frames=budget_cap)
+        fps, target = auto_fps(effective_duration, max_frames=budget_cap, max_fps=max_fps)
     if args.fps is not None:
-        fps = min(args.fps, MAX_FPS)
+        if args.fps > max_fps:
+            print(
+                f"[watch] --fps {args.fps:g} exceeds the {max_fps:g} fps ceiling — using "
+                f"{max_fps:g}. Raise it with WATCH_MAX_FPS in ~/.config/watch/.env, and pair "
+                "it with --start/--end so the frame bill stays small.",
+                file=sys.stderr,
+            )
+        fps = min(args.fps, max_fps)
         target = max(1, int(round(fps * effective_duration)))
 
     if transcript_segments and focused:
@@ -362,12 +385,14 @@ def main() -> int:
         except Exception as exc:
             print(f"[watch] subtitle parse failed: {exc}", file=sys.stderr)
 
-    if not transcript_segments and not args.no_whisper and video_path and meta.get("has_audio"):
+    # audio_source, not video_path: an audio-only file clears video_path so the
+    # frame engines are skipped, but its audio is exactly what we want to send.
+    if not transcript_segments and not args.no_whisper and audio_source and meta.get("has_audio"):
         backend, api_key = load_api_key(args.whisper)
         if backend and api_key:
             try:
                 all_segments, used_backend = transcribe_video(
-                    video_path,
+                    audio_source,
                     work / "audio.mp3",
                     backend=backend,
                     api_key=api_key,

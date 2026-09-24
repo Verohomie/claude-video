@@ -2,6 +2,7 @@
 """Shared /watch configuration helpers."""
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 
@@ -20,6 +21,15 @@ DETAILS = {"transcript", "efficient", "balanced", "token-burner"}
 DEFAULT_QUALITY = "1080"
 
 QUALITIES = {"360", "480", "720", "1080", "1440", "2160", "best"}
+
+# Ceiling on the sampling rate, in frames per second of video. 2.0 is a sane
+# default, not a law: auto-fps targets a frame BUDGET, so this only ever binds an
+# explicit --fps. It exists for sub-second and fast-action clips, where a budget
+# spread over the whole video yields one or two frames of the moment that
+# mattered. Raise it for a short focused range, not for a whole film — cost is
+# the real ceiling, at roughly 200 tokens per 512px frame.
+#   WATCH_MAX_FPS=24 with --start/--end and --max-frames on a few seconds.
+DEFAULT_MAX_FPS = 2.0
 
 
 def read_env_file(path: Path | None = None) -> dict[str, str]:
@@ -73,9 +83,27 @@ def get_config() -> dict[str, object]:
     if quality not in QUALITIES:
         quality = DEFAULT_QUALITY
 
+    raw_max_fps = (
+        os.environ.get("WATCH_MAX_FPS")
+        or file_values.get("WATCH_MAX_FPS")
+        or DEFAULT_MAX_FPS
+    )
+    # Same contract as detail and quality: an unusable value falls back to the
+    # default rather than raising, so a typo in .env cannot take down a run that
+    # has already paid for a download.
+    try:
+        max_fps = float(raw_max_fps)
+    except (TypeError, ValueError):
+        max_fps = DEFAULT_MAX_FPS
+    # isfinite as well as > 0: "1e400" and "inf" both parse, and both compare
+    # greater than zero, which would leave --fps effectively unclamped.
+    if not (math.isfinite(max_fps) and max_fps > 0):
+        max_fps = DEFAULT_MAX_FPS
+
     return {
         "detail": detail,
         "quality": quality,
+        "max_fps": max_fps,
         "config_file": str(CONFIG_FILE),
     }
 

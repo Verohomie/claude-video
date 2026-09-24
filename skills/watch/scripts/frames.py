@@ -188,8 +188,10 @@ def _vfr_flag() -> tuple[str, ...]:
     return ("-fps_mode", "vfr") if probe.returncode == 0 else ("-vsync", "vfr")
 
 
-def _clamp_fps(fps: float, duration_seconds: float, max_frames: int) -> tuple[float, int]:
-    fps = min(fps, MAX_FPS)
+def _clamp_fps(
+    fps: float, duration_seconds: float, max_frames: int, max_fps: float | None = None
+) -> tuple[float, int]:
+    fps = min(fps, MAX_FPS if max_fps is None else max_fps)
     target = min(max_frames, max(1, int(round(fps * duration_seconds))))
     return fps, target
 
@@ -258,11 +260,38 @@ def get_metadata(video_path: str) -> dict:
         "codec": video_stream.get("codec_name"),
         "size_bytes": int(fmt.get("size") or 0),
         "has_audio": audio_stream is not None,
+        # There was a has_audio but no has_video, so an audio-only source reached
+        # the extractors and died on a raw "ffmpeg scene extraction failed" —
+        # after the download had already been paid for. A cover-art MP3 has a
+        # video stream of one still image, so also require a real duration:
+        # a single attached picture is not something to extract frames from.
+        "has_video": bool(video_stream) and _is_real_video_stream(video_stream),
     }
 
 
-def auto_fps(duration_seconds: float, max_frames: int = 100) -> tuple[float, int]:
-    """Pick fps that targets a sensible frame budget for full-video scans."""
+def _is_real_video_stream(stream: dict) -> bool:
+    """False for an attached picture (cover art), true for actual footage.
+
+    ffprobe reports an MP3's embedded artwork as a video stream, so presence
+    alone is not enough. The disposition flag is authoritative when set; a
+    single-frame stream is the fallback signal for files that omit it.
+    """
+    if (stream.get("disposition") or {}).get("attached_pic"):
+        return False
+    if str(stream.get("nb_frames") or "").strip() == "1":
+        return False
+    return True
+
+
+def auto_fps(
+    duration_seconds: float, max_frames: int = 100, max_fps: float | None = None
+) -> tuple[float, int]:
+    """Pick fps that targets a sensible frame budget for full-video scans.
+
+    ``max_fps`` only ever binds here when the budget implies a rate above the
+    ceiling, which needs a very short video — the budget, not the ceiling, is
+    what normally decides.
+    """
     if duration_seconds <= 0:
         return 1.0, 1
 
@@ -277,13 +306,15 @@ def auto_fps(duration_seconds: float, max_frames: int = 100) -> tuple[float, int
     else:
         target = max_frames
 
-    return _clamp_fps(target / duration_seconds, duration_seconds, max_frames)
+    return _clamp_fps(target / duration_seconds, duration_seconds, max_frames, max_fps)
 
 
-def auto_fps_focus(duration_seconds: float, max_frames: int = 100) -> tuple[float, int]:
+def auto_fps_focus(
+    duration_seconds: float, max_frames: int = 100, max_fps: float | None = None
+) -> tuple[float, int]:
     """Denser budget for user-specified ranges — they are zooming in for detail."""
     if duration_seconds <= 0:
-        return min(MAX_FPS, 2.0), 2
+        return (MAX_FPS if max_fps is None else max_fps), 2
 
     if duration_seconds <= 5:
         target = min(max_frames, max(10, int(round(duration_seconds * 6))))
@@ -298,7 +329,7 @@ def auto_fps_focus(duration_seconds: float, max_frames: int = 100) -> tuple[floa
     else:
         target = max_frames
 
-    return _clamp_fps(target / duration_seconds, duration_seconds, max_frames)
+    return _clamp_fps(target / duration_seconds, duration_seconds, max_frames, max_fps)
 
 
 def _frame_flatness(frame: bytes) -> float:
