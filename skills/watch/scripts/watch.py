@@ -79,6 +79,13 @@ def write_manifest(
                 "timestamp_seconds": frame["timestamp_seconds"],
                 "timestamp": format_time(frame["timestamp_seconds"]),
                 "reason": frame.get("reason", "selected"),
+                # Present only when this frame absorbed near-duplicates: the
+                # source was unchanged from its timestamp through to here.
+                **(
+                    {"represents_until_seconds": frame["represents_until"]}
+                    if frame.get("represents_until") is not None
+                    else {}
+                ),
             }
             for frame in frames
         ],
@@ -463,6 +470,18 @@ def main() -> int:
             f"- **Frames:** {detail_count} selected from {frame_meta.get('candidate_count', detail_count)} "
             f"candidates ({engine}{fallback}{dedup_note}, {range_mode} range, budget {target}, cap {cap_label})"
         )
+        # State the span outright. Without this the only coverage signal is the
+        # last frame's timestamp, which understates it whenever duplicates were
+        # dropped -- a static tail collapses to one frame and the run looks like
+        # it stopped early when it had in fact sampled the whole range.
+        if frames:
+            covered_to = max(
+                float(fr.get("represents_until") or fr["timestamp_seconds"]) for fr in frames
+            )
+            print(
+                f"- **Frame coverage:** sampled across {format_time(effective_start)}–"
+                f"{format_time(effective_end)}; frames represent up to {format_time(covered_to)}"
+            )
     elif not cue_frames:
         print("- **Frames:** skipped (transcript detail)")
     if cue_frames:
@@ -536,9 +555,17 @@ def main() -> int:
         )
         print()
         for frame in frames:
+            # A frame that absorbed duplicates stands for everything up to
+            # represents_until. Saying so on the line itself is what stops a late
+            # last-timestamp being read as "the rest was never looked at".
+            until = frame.get("represents_until")
+            held = ""
+            if isinstance(until, (int, float)) and until > frame["timestamp_seconds"] + 1.0:
+                held = f" → {format_time(until)} unchanged"
             print(
                 f"- `{frame['path']}` "
-                f"(t={format_time(frame['timestamp_seconds'])}, reason={frame.get('reason', 'selected')})"
+                f"(t={format_time(frame['timestamp_seconds'])}{held}, "
+                f"reason={frame.get('reason', 'selected')})"
             )
     else:
         print("_No frames extracted._")

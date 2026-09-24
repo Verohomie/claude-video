@@ -916,12 +916,24 @@ def _dedupe_by_deltas(
     kept = [candidates[0]]
     last = thumbs[0]
     dropped: list[dict] = []
+    # A dropped frame is not a gap in coverage -- it was looked at and found
+    # unchanged. Record how far each survivor's stretch of sameness ran, so the
+    # report can say "unchanged until 38:00" instead of leaving a reader to infer
+    # from a last timestamp of 3:45 that the rest was never examined. Without
+    # this the information exists only at the moment of dropping and is lost.
+    collapsed_until: dict[int, float] = {}
     for cand, thumb in zip(candidates[1:], thumbs[1:]):
         if _frame_delta(thumb, last) <= threshold:
             dropped.append(cand)
+            ts = cand.get("timestamp_seconds")
+            if isinstance(ts, (int, float)):
+                collapsed_until[len(kept) - 1] = float(ts)
         else:
             kept.append(cand)
             last = thumb
+
+    for index, until in collapsed_until.items():
+        kept[index]["represents_until"] = round(until, 2)
 
     for cand in dropped:
         try:

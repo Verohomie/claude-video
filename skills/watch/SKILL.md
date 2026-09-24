@@ -217,8 +217,13 @@ python3 "${SKILL_DIR}/scripts/watch.py" "$URL" --start 1:12:00
 
 **Proper nouns in a transcript are unverified.** Captions and Whisper both transcribe phonetically, so names come back wrong or invented — a person's name as a plausible-sounding different name, a product as a near-homophone, an acronym expanded incorrectly. Frames are the corrective: title cards, slides, on-screen UI and lower thirds usually spell a name correctly, so check a name against a frame before stating it. Where no frame confirms it — including every `transcript`-detail run, which has no frames at all — give the name as heard and say it came from the transcript and is unverified. This applies to people, companies, products, model names, URLs, prices and figures: anything the user might repeat, quote, or act on.
 
-**Read the Frames line before you characterise coverage.** Three cases change what you can honestly claim:
-- `N near-duplicates dropped` — **the last frame's timestamp is not where the video stops being covered.** Duplicates are dropped because nothing changed, so a frame at 3:45 in a 40-minute video can be standing for the whole unchanging stretch after it. Sampling ran across the full range; what you are holding is the set of moments that *differ*. So "the last frame is at 3:45" does not mean "I only saw the first 3:45" — say the screen was unchanged from 3:45 onward, which is what it actually means, and do not report the tail as unseen.
+**The last frame's timestamp is NOT where coverage ends.** Read the **Frame coverage** line, which states the sampled range outright, and the `→ MM:SS unchanged` marker on individual frames.
+
+A frame listed as `(t=00:04 → 00:37 unchanged, reason=uniform)` means the source did not change between those two times — that frame stands for the whole stretch. Near-identical frames are dropped on purpose, because thirty pictures of one unchanging slide cost a great deal and say nothing. So a 40-minute screen recording whose last frame is at 3:45 was still sampled across all 40 minutes; what you hold is the set of moments that *differ*.
+
+Say "the screen was unchanged from 3:45 onward". Never say "I only have frames up to 3:45" — that is the one reading the report is built to prevent.
+
+Two other cases change what you can claim:
 - `fell back from scene: N cuts left a gap in the range` — scene detection found cuts but they were bunched, so frames were sampled uniformly instead. Coverage is even; you are not seeing every cut.
 - A `[watch]` line on stderr saying the sampling rate was lowered so frames *spread across the whole range* — the normal, correct outcome. No caveat needed.
 
