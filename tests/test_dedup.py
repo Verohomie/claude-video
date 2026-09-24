@@ -100,7 +100,8 @@ def test_thumb_frames_match_candidate_count(cut_clip: Path, tmp_path: Path):
     out = frames.extract_scene_candidates(str(cut_clip), tmp_path / "f", max_frames=None)
     thumbs = frames._thumb_frames([Path(fr["path"]) for fr in out])
     assert len(thumbs) == len(out)
-    assert all(len(t) == frames.DEDUP_THUMB * frames.DEDUP_THUMB for t in thumbs)
+    expected = frames.DEDUP_THUMB * frames.DEDUP_THUMB * frames.DEDUP_THUMB_CHANNELS
+    assert all(len(t) == expected for t in thumbs)
 
 
 def test_dedupe_perceptual_collapses_static_clip(static_clip: Path, tmp_path: Path):
@@ -114,12 +115,52 @@ def test_dedupe_perceptual_collapses_static_clip(static_clip: Path, tmp_path: Pa
 
 
 def test_dedupe_perceptual_keeps_distinct_cuts(cut_clip: Path, tmp_path: Path):
-    """Distinct color shots differ in luma, so frame-delta keeps them all."""
+    """Distinct colour shots are distinct frames, so frame-delta keeps them all.
+
+    Note the clip's first cut is red -> green, which are 1.11 apart in luma: this
+    passes on an RGB comparison and would not on a grayscale one.
+    """
     out = frames.extract_scene_candidates(str(cut_clip), tmp_path / "f", max_frames=None)
     n_before = len(out)
     survivors, dropped = frames.dedupe_perceptual(out)
     assert dropped == 0
     assert len(survivors) == n_before
+
+
+def test_dedupe_keeps_a_cut_between_hues_of_equal_brightness(
+    equal_luma_cut_clip: Path, tmp_path: Path
+):
+    """ffmpeg red (255,0,0) -> green (0,128,0): 1.11 apart in luma, 127.7 in RGB.
+
+    Under DEDUP_THRESHOLD=2.0 a grayscale comparison called these the same shot
+    and deleted the green one, losing a real cut. A theme switch or a
+    motion-graphics colour change is the everyday version of this.
+    """
+    out = frames.extract(str(equal_luma_cut_clip), tmp_path / "f", fps=2.0, max_frames=4)
+    assert len(out) >= 2
+    survivors, dropped = frames.dedupe_perceptual(out)
+    assert len(survivors) >= 2, "the second shot was dropped as a duplicate"
+
+
+def test_grayscale_would_have_collapsed_that_cut(equal_luma_cut_clip: Path, tmp_path: Path):
+    """Counterfactual, so the test above cannot pass for the wrong reason.
+
+    Converts the RGB thumbnails to luma by hand and shows the delta falls under
+    the threshold — i.e. the old code really did drop this frame.
+    """
+    out = frames.extract(str(equal_luma_cut_clip), tmp_path / "f", fps=2.0, max_frames=4)
+    thumbs = frames._thumb_frames([Path(fr["path"]) for fr in out])
+    assert len(thumbs) >= 2
+
+    def to_luma(rgb: bytes) -> bytes:
+        return bytes(
+            int(0.299 * rgb[i] + 0.587 * rgb[i + 1] + 0.114 * rgb[i + 2])
+            for i in range(0, len(rgb), 3)
+        )
+
+    first, last = thumbs[0], thumbs[-1]
+    assert frames._frame_delta(first, last) > frames.DEDUP_THRESHOLD  # RGB: distinct
+    assert frames._frame_delta(to_luma(first), to_luma(last)) <= frames.DEDUP_THRESHOLD
 
 
 # --- engine integration: dedup runs before the cap, reports deduped_count -----

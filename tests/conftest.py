@@ -71,6 +71,28 @@ def build_cut_clip(
     ])
 
 
+def build_equal_luma_cut_clip(path: Path, seg: float = 1.0, fps: int = 5) -> None:
+    """Two shots whose brightness matches but whose colour does not.
+
+    ffmpeg's "red" is (255,0,0) and "green" is (0,128,0): 1.11 apart in luma --
+    under DEDUP_THRESHOLD, so a grayscale comparison calls them the same shot and
+    deletes the second -- and 127.7 apart as a mean per-channel RGB difference.
+    A hard cut between two hues of equal brightness is ordinary in motion
+    graphics and title cards, and this is the clip that catches it.
+    """
+    inputs: list[str] = []
+    for color in ("red", "green"):
+        inputs += ["-f", "lavfi", "-t", str(seg), "-i", f"color=c={color}:s=320x240:r={fps}"]
+    _run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        *inputs,
+        "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[out]", "-map", "[out]",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-force_key_frames", f"expr:gte(t,n_forced*{seg})",
+        str(path),
+    ])
+
+
 def build_static_clip(
     path: Path,
     duration: float = 3.0,
@@ -204,6 +226,13 @@ def long_cut_clip(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """
     path = tmp_path_factory.mktemp("clips") / "long_cuts.mp4"
     build_cut_clip(path, n=14, seg=3.0, size="320x240", fps=5)
+    return path
+
+
+@pytest.fixture(scope="session")
+def equal_luma_cut_clip(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    path = tmp_path_factory.mktemp("clips") / "equal_luma.mp4"
+    build_equal_luma_cut_clip(path)
     return path
 
 

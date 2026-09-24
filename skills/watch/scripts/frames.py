@@ -38,13 +38,21 @@ KEYFRAME_MIN = 4
 # history counts too, so this is not a limit to relax — a wider frame would fail
 # the whole request, not just cost more.
 MAX_READ_DIMENSION = 1998
-# Frame-delta dedup: downscale each frame to a DEDUP_THUMB x DEDUP_THUMB
-# grayscale thumbnail and treat two frames as near-identical when their mean
-# per-pixel difference (0-255) is at or below DEDUP_THRESHOLD. Conservative on
-# purpose: only collapses frames that are visually the same shot, so a code diff
-# / scrolling terminal / slide-gaining-a-bullet survives. Unlike a within-frame
-# perceptual hash, this distinguishes flat frames (solid slides, fades) by luma.
+# Frame-delta dedup: downscale each frame to a DEDUP_THUMB x DEDUP_THUMB RGB
+# thumbnail and treat two frames as near-identical when their mean per-channel
+# difference (0-255) is at or below DEDUP_THRESHOLD. Conservative on purpose:
+# only collapses frames that are visually the same shot, so a code diff /
+# scrolling terminal / slide-gaining-a-bullet survives. Unlike a within-frame
+# perceptual hash, this distinguishes flat frames (solid slides, fades) by colour.
+#
+# RGB and not luma: two hues can share a brightness. A hard cut from a red card
+# to a green card in motion graphics, or a theme switch that keeps contrast, is a
+# large colour change and almost no luma change -- so in grayscale it read as a
+# near-zero delta, came in under the threshold, and the incoming shot was deleted
+# as a duplicate of the one before it. Costs 3x the thumbnail bytes (768 vs 256
+# per frame) and nothing else; the threshold means the same thing per channel.
 DEDUP_THUMB = 16
+DEDUP_THUMB_CHANNELS = 3
 DEDUP_THRESHOLD = 2.0
 SHOWINFO_TS_RE = re.compile(r"pts_time:([0-9.]+)")
 
@@ -743,20 +751,21 @@ def _even_sample(candidates: list[dict], n: int) -> list[dict]:
 
 
 def _frame_delta(a: bytes, b: bytes) -> float:
-    """Mean absolute per-pixel difference (0-255) between two grayscale
-    thumbnails. Mismatched lengths are treated as maximally different so a
-    decode hiccup never collapses distinct frames."""
+    """Mean absolute per-channel difference (0-255) between two RGB thumbnails.
+
+    Mismatched lengths are treated as maximally different so a decode hiccup
+    never collapses distinct frames."""
     if not a or len(a) != len(b):
         return float("inf")
     return sum(abs(x - y) for x, y in zip(a, b)) / len(a)
 
 
 def _thumb_frames(paths: list[Path]) -> list[bytes]:
-    """Decode every frame in ``paths`` to a small grayscale thumbnail via one
-    ffmpeg pass over the JPEG sequence.
+    """Decode every frame in ``paths`` to a small RGB thumbnail via one ffmpeg
+    pass over the JPEG sequence.
 
     ffmpeg does the pixel decode (keeps us pure-stdlib); we slice the raw
-    grayscale stream into one ``DEDUP_THUMB``-square thumbnail per frame.
+    interleaved RGB stream into one ``DEDUP_THUMB``-square thumbnail per frame.
     Fail-open: any ffmpeg error, an unrecognized name, or a byte-count mismatch
     returns ``[]`` so the caller skips dedup rather than breaking extraction.
     """
@@ -775,7 +784,7 @@ def _thumb_frames(paths: list[Path]) -> list[bytes]:
         "-loglevel", "error",
         "-start_number", str(int(digits)),
         "-i", pattern,
-        "-vf", f"scale={DEDUP_THUMB}:{DEDUP_THUMB},format=gray",
+        "-vf", f"scale={DEDUP_THUMB}:{DEDUP_THUMB},format=rgb24",
         "-f", "rawvideo",
         "-",
     ]
@@ -783,7 +792,7 @@ def _thumb_frames(paths: list[Path]) -> list[bytes]:
     if result.returncode != 0:
         return []
 
-    chunk = DEDUP_THUMB * DEDUP_THUMB
+    chunk = DEDUP_THUMB * DEDUP_THUMB * DEDUP_THUMB_CHANNELS
     data = result.stdout
     if len(data) != chunk * len(paths):
         return []
