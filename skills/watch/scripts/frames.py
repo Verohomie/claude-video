@@ -8,6 +8,7 @@ zooming in for detail).
 """
 from __future__ import annotations
 
+import functools
 import json
 import re
 import shutil
@@ -133,6 +134,42 @@ def _scale_filter(resolution: int) -> str:
         f"scale=w='min({resolution},iw)':h='min({MAX_READ_DIMENSION},ih)':"
         "force_original_aspect_ratio=decrease:force_divisible_by=2"
     )
+
+
+@functools.lru_cache(maxsize=1)
+def _vfr_flag() -> tuple[str, ...]:
+    """The variable-frame-rate flag this ffmpeg accepts, as argv.
+
+    -vsync was deprecated in ffmpeg 5.1 and REMOVED in 9.0; -fps_mode has
+    existed since 5.1. So neither spelling works everywhere: on 9.x, -vsync
+    aborts the run with "Unrecognized option 'vsync'" before a single frame is
+    written, and on builds older than 5.1 -fps_mode does the same. 8.x accepts
+    both, the old one with a deprecation notice -- which is why a machine on 8.x
+    sees nothing wrong.
+
+    Probe by RUNNING the flag against a null source rather than by parsing
+    `-version` or help text: what matters is whether this binary accepts it, and
+    distro builds vary enough that the version string is not a reliable proxy.
+    One ~30ms encode, cached for the process.
+    """
+    try:
+        probe = subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "nullsrc=d=0.1",
+                "-fps_mode", "vfr", "-frames:v", "1", "-f", "null", "-",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError:
+        # ffmpeg missing or unrunnable. Every caller already raises a clear
+        # "ffmpeg is not installed" of its own, so fall back rather than mask it
+        # with a traceback from the probe.
+        return ("-vsync", "vfr")
+    return ("-fps_mode", "vfr") if probe.returncode == 0 else ("-vsync", "vfr")
 
 
 def _clamp_fps(fps: float, duration_seconds: float, max_frames: int) -> tuple[float, int]:
@@ -546,7 +583,7 @@ def extract_scene_candidates(
     cmd += [
         "-i", str(Path(video_path).resolve()),
         "-vf", vf,
-        "-vsync", "vfr",
+        *_vfr_flag(),
     ]
     if max_frames is not None:
         cmd += ["-frames:v", str(max_frames)]
@@ -905,7 +942,7 @@ def extract_keyframes(
         "-skip_frame", "nokey",
         "-i", str(Path(video_path).resolve()),
         "-vf", f"{_scale_filter(resolution)},showinfo",
-        "-vsync", "vfr",
+        *_vfr_flag(),
         "-q:v", "4",
         output_pattern,
     ]

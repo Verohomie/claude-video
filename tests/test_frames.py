@@ -1,6 +1,7 @@
 """Keyframe engine + preserved scene/uniform fallbacks."""
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import frames
@@ -133,6 +134,98 @@ def test_uniform_spreads_when_cue_frames_shrink_the_budget(long_static_clip: Pat
     assert meta["engine"] == "uniform"
     ts = [fr["timestamp_seconds"] for fr in out]
     assert ts[-1] > 30.0, f"frames only covered {ts[-1]}s of a ~42s clip"
+
+
+# --- the frame-rate-mode flag ------------------------------------------------
+#
+# -vsync was removed in ffmpeg 9.0 and -fps_mode did not exist before 5.1, so
+# neither spelling works everywhere. This host is on 8.x, which accepts both, so
+# only one branch of the probe can be exercised for real -- both are stubbed.
+
+
+def _stub_probe(monkeypatch, returncode: int | None = 0, raises: bool = False):
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, *a, **kw):
+        calls.append(cmd)
+        if raises:
+            raise OSError("ffmpeg not found")
+        return subprocess.CompletedProcess(cmd, returncode, "", "")
+
+    monkeypatch.setattr(frames.subprocess, "run", fake_run)
+    frames._vfr_flag.cache_clear()
+    return calls
+
+
+def test_vfr_flag_uses_fps_mode_when_the_probe_succeeds(monkeypatch):
+    _stub_probe(monkeypatch, returncode=0)
+    try:
+        assert frames._vfr_flag() == ("-fps_mode", "vfr")
+    finally:
+        frames._vfr_flag.cache_clear()
+
+
+def test_vfr_flag_falls_back_to_vsync_when_the_probe_is_rejected(monkeypatch):
+    """An ffmpeg older than 5.1 rejects -fps_mode."""
+    _stub_probe(monkeypatch, returncode=1)
+    try:
+        assert frames._vfr_flag() == ("-vsync", "vfr")
+    finally:
+        frames._vfr_flag.cache_clear()
+
+
+def test_vfr_flag_survives_a_missing_ffmpeg(monkeypatch):
+    """The probe must not be what reports a missing ffmpeg -- callers do that."""
+    _stub_probe(monkeypatch, raises=True)
+    try:
+        assert frames._vfr_flag() == ("-vsync", "vfr")
+    finally:
+        frames._vfr_flag.cache_clear()
+
+
+def test_vfr_flag_probes_by_running_the_flag_not_by_parsing_a_version(monkeypatch):
+    calls = _stub_probe(monkeypatch, returncode=0)
+    try:
+        frames._vfr_flag()
+        assert len(calls) == 1
+        cmd = calls[0]
+        assert "-fps_mode" in cmd
+        assert "nullsrc=d=0.1" in cmd          # a null source, not the user's video
+        assert "-version" not in cmd
+        assert "-h" not in cmd
+    finally:
+        frames._vfr_flag.cache_clear()
+
+
+def test_vfr_flag_is_probed_once_per_process(monkeypatch):
+    calls = _stub_probe(monkeypatch, returncode=0)
+    try:
+        for _ in range(5):
+            frames._vfr_flag()
+        assert len(calls) == 1
+    finally:
+        frames._vfr_flag.cache_clear()
+
+
+def test_vfr_flag_on_this_host_is_one_of_the_two(cut_clip: Path):
+    """Unstubbed: whatever this machine's ffmpeg is, the answer must be usable."""
+    frames._vfr_flag.cache_clear()
+    assert frames._vfr_flag() in (("-fps_mode", "vfr"), ("-vsync", "vfr"))
+
+
+def test_scene_engine_still_works_with_the_probed_flag(cut_clip: Path, tmp_path: Path):
+    """End to end on the real ffmpeg: the flag the probe picked is accepted."""
+    out, meta = frames.extract_scene_or_uniform(
+        str(cut_clip), tmp_path / "f", fps=2.0, target_frames=50, max_frames=100,
+    )
+    assert meta["engine"] == "scene"
+    assert len(out) >= frames.SCENE_MIN_FRAMES
+
+
+def test_keyframe_engine_still_works_with_the_probed_flag(cut_clip: Path, tmp_path: Path):
+    out, meta = frames.extract_keyframes(str(cut_clip), tmp_path / "f", max_frames=50)
+    assert meta["engine"] == "keyframe"
+    assert len(out) >= frames.KEYFRAME_MIN
 
 
 def test_range_span_prefers_caller_knowledge_over_probing(tmp_path: Path):
