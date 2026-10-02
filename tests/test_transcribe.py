@@ -135,3 +135,73 @@ def test_filter_range_keeps_overlapping_segments():
 def test_filter_range_without_bounds_is_a_noop():
     segs = [{"start": 0.0, "end": 5.0, "text": "a"}]
     assert transcribe.filter_range(segs, None, None) is segs
+
+
+# --- YouTube's scrolling automatic captions -----------------------------------
+
+# Verbatim shape of a YouTube auto-caption file: each cue opens with a line
+# holding one space, carries the previous line over untimed, and adds the new
+# words with per-word timing tags; ~10ms cues in between repeat the carried line.
+ROLLING = (
+    "WEBVTT\nKind: captions\nLanguage: en\n\n"
+    "00:00:00.000 --> 00:00:02.630 align:start position:0%\n \n"
+    "AI<00:00:00.400><c> can</c><00:00:00.560><c> now</c><00:00:00.760><c> watch</c>\n\n"
+    "00:00:02.630 --> 00:00:02.640 align:start position:0%\n"
+    "AI can now watch\n \n\n"
+    "00:00:02.640 --> 00:00:04.390 align:start position:0%\n"
+    "AI can now watch\n"
+    "thank<00:00:02.960><c> you</c><00:00:03.120><c> thank</c><00:00:03.280><c> you</c>\n\n"
+    "00:00:04.390 --> 00:00:04.400 align:start position:0%\n"
+    "thank you thank you\n \n\n"
+    "00:00:04.400 --> 00:00:06.230 align:start position:0%\n"
+    "thank you thank you\n"
+    "for<00:00:04.640><c> watching</c>\n\n"
+)
+
+
+def _raw_vtt(tmp_path, text: str) -> str:
+    path = tmp_path / "subs.vtt"
+    path.write_bytes(text.encode("utf-8"))
+    return str(path)
+
+
+def test_rolling_captions_print_each_word_once(tmp_path):
+    segs = transcribe.parse_vtt(_raw_vtt(tmp_path, ROLLING))
+    words = " ".join(s["text"] for s in segs).split()
+    assert words == "AI can now watch thank you thank you for watching".split()
+
+
+def test_rolling_captions_keep_the_first_line(tmp_path):
+    """The opening cue starts with a one-space line; it must not end the cue."""
+    segs = transcribe.parse_vtt(_raw_vtt(tmp_path, ROLLING))
+    assert segs[0]["start"] == 0.0
+    assert segs[0]["text"] == "AI can now watch"
+
+
+def test_real_repetition_in_speech_survives(tmp_path):
+    """'thank you thank you' was said twice; only the carried copy goes."""
+    text = " ".join(s["text"] for s in transcribe.parse_vtt(_raw_vtt(tmp_path, ROLLING)))
+    assert text.count("thank you") == 2
+
+
+def test_human_captions_without_word_timings_are_untouched(tmp_path):
+    manual = (
+        "WEBVTT\n\n"
+        "00:00:01.000 --> 00:00:03.000\nFirst line of a caption\nsecond line of it\n\n"
+        "00:00:03.000 --> 00:00:05.000\nsecond line of it\nthen something new\n\n"
+    )
+    segs = transcribe.parse_vtt(_raw_vtt(tmp_path, manual))
+    assert [s["text"] for s in segs] == [
+        "First line of a caption second line of it",
+        "second line of it then something new",
+    ]
+
+
+def test_a_timestamp_line_ends_a_cue_even_without_a_blank_line(tmp_path):
+    squashed = (
+        "WEBVTT\n\n"
+        "00:00:01.000 --> 00:00:02.000\none\n   \n"
+        "00:00:02.000 --> 00:00:03.000\ntwo\n"
+    )
+    segs = transcribe.parse_vtt(_raw_vtt(tmp_path, squashed))
+    assert [s["text"] for s in segs] == ["one", "two"]

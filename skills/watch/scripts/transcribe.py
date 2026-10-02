@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Parse a WebVTT subtitle file into a clean, timestamped transcript.
 
-YouTube auto-subs emit rolling-duplicate cues (each line appears 2-3 times as it
-scrolls). We dedupe consecutive identical cues and merge their time ranges.
+YouTube auto-subs scroll: every line is shown again, untimed, beneath the next
+one. parse_vtt keeps only the word-timed lines of such files, then dedupes any
+remaining consecutive identical cues and merges their time ranges.
 """
 from __future__ import annotations
 
@@ -21,6 +22,8 @@ from pathlib import Path
 _STAMP = r"(?:\d{2,}:)?\d{2}:\d{2}[.,]\d{3}"
 TS_RE = re.compile(rf"({_STAMP})\s*-->\s*({_STAMP})")
 TAG_RE = re.compile(r"<[^>]+>")
+# A word-timing tag inside a cue line: "burning<00:00:02.960><c> up</c>".
+WORD_TIME_RE = re.compile(r"<(?:\d{2,}:)?\d{2}:\d{2}[.,]\d{3}>")
 
 
 def _to_seconds(stamp: str) -> float:
@@ -36,7 +39,7 @@ def parse_vtt(path: str) -> list[dict]:
     text = Path(path).read_text(encoding="utf-8", errors="ignore")
     lines = text.splitlines()
 
-    segments: list[dict] = []
+    cues: list[tuple[float, float, list[str]]] = []
     i = 0
     while i < len(lines):
         match = TS_RE.match(lines[i])
@@ -48,22 +51,48 @@ def parse_vtt(path: str) -> list[dict]:
         end = _to_seconds(match.group(2))
         i += 1
 
+        # A cue ends at a truly empty line. YouTube opens each cue with a line
+        # holding a single space; treating that as the end dropped the cue's
+        # real text, which went unnoticed while the carried-over repeat of it
+        # turned up in the next cue. A timestamp line also ends it, so a stray
+        # whitespace line elsewhere cannot fold the next cue into this one.
+        raw_lines: list[str] = []
+        while i < len(lines) and lines[i] != "" and not TS_RE.match(lines[i]):
+            raw_lines.append(lines[i])
+            i += 1
+        cues.append((start, end, raw_lines))
+        if i < len(lines) and lines[i] == "":
+            i += 1  # Step over the blank line, but never over a timestamp line.
+
+    # YouTube's automatic captions scroll: each cue shows the line already
+    # spoken, carried over untouched, above the new line, and only the new
+    # words carry per-word timing tags. Between those come ~10ms cues that
+    # repeat the carried line alone. Reading every line therefore printed each
+    # sentence twice -- 3,976 words for ~2,000 spoken on an 8-minute video.
+    # When a file has word timings at all, the timed lines ARE the speech, so
+    # keep exactly those; human-written captions have none and pass through
+    # whole. Exact rather than a word-overlap guess, so a speaker who really
+    # does repeat themselves is not trimmed.
+    rolling = any(WORD_TIME_RE.search(line) for _, _, raw in cues for line in raw)
+
+    segments: list[dict] = []
+    for start, end, raw_lines in cues:
+        if rolling:
+            raw_lines = [line for line in raw_lines if WORD_TIME_RE.search(line)]
         cue_lines: list[str] = []
-        while i < len(lines) and lines[i].strip():
+        for line in raw_lines:
             # Strip cue tags FIRST, then unescape -- in that order an escaped
             # "&lt;b&gt;" survives as the literal text "<b>" the caption author
             # wrote, instead of turning into a tag and being deleted. Without the
             # unescape, ">>" speaker markers arrive as "&gt;&gt;" and "&amp;" /
             # "&#39;" reach the model raw.
-            cleaned = html.unescape(TAG_RE.sub("", lines[i])).strip()
+            cleaned = html.unescape(TAG_RE.sub("", line)).strip()
             if cleaned:
                 cue_lines.append(cleaned)
-            i += 1
 
         cue_text = " ".join(cue_lines).strip()
         if cue_text:
             segments.append({"start": round(start, 2), "end": round(end, 2), "text": cue_text})
-        i += 1
 
     return _dedupe(segments)
 
