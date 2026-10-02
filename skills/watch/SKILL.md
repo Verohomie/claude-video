@@ -142,10 +142,13 @@ Within a single session, you can skip Step 0 on follow-up `/watch` calls — onc
 **Step 2 — run the watch script.** Pass the source verbatim. Do not shell-escape it yourself beyond normal quoting:
 
 ```bash
-python3 "${SKILL_DIR}/scripts/watch.py" "<source>"
+python3 "${SKILL_DIR}/scripts/watch.py" "<source>" --question "<the user's question>"
 ```
 
+**Always pass the user's question with `--question`** when they asked one. On a Gemini run (see "Engines" below) it is what Google's model looks for — without it Gemini can only summarize. The local engine ignores it, so passing it is never wrong. Omit it only when the user asked nothing.
+
 Optional flags:
+- `--engine auto|gemini|local` — who watches the video. See "Engines" below; leave it off unless the user asks or a Gemini run failed.
 - `--detail transcript|efficient|balanced|token-burner` — fidelity/speed dial. `transcript` = no frames (transcript only, skips video download when captions exist); `efficient` = fast keyframes (cap 50); `balanced` = scene-aware frames (cap 100); `token-burner` = scene-aware, uncapped.
 - `--start T` / `--end T` — focus on a section. Accepts `SS`, `MM:SS`, or `HH:MM:SS`. When either is set, fps auto-scales denser (see "Focusing on a section" below).
 - `--timestamps T1,T2,…` — grab a frame at each of these absolute timestamps (`SS`, `MM:SS`, or `HH:MM:SS`). Use this after reading the transcript to capture deictic moments the presenter flags ("look here", "as you can see", "notice this") that visual selection alone may miss. See "Transcript-cue frames" below.
@@ -157,6 +160,28 @@ Optional flags:
 - `--whisper groq|openai` — force a specific Whisper backend (default: prefer Groq if both keys exist)
 - `--no-whisper` — disable the Whisper fallback entirely (frames-only if no captions)
 - `--no-dedup` — keep near-duplicate frames. By default a frame-delta pass drops frames that are visually near-identical to the previous kept one (held slides, static screen recordings, paused video) so the frame budget goes to distinct content; the report's **Frames** line notes how many were dropped. Pass this only if the user needs every sampled frame (e.g. judging subtle frame-to-frame motion).
+
+### Engines: Gemini watches, or you do
+
+There are two engines, and the report's **Engine** line says which one ran.
+
+- **local** — everything else in this file: frames plus a transcript, which you read yourself.
+- **gemini** — Google's Gemini model watches the video in its agentic mode (it decides which moments to look at closely, using pictures, audio and speech together) and returns a written answer with timestamps. For a YouTube link nothing is downloaded at all: the link goes straight to Google's API, so YouTube's download blocks never come into it. You read one answer instead of dozens of frames, which costs a fraction of the tokens.
+
+**Default (`auto`): Gemini only for YouTube links, and only when `GEMINI_API_KEY` is set.** Local files and other sites stay on the local engine even with a key, because those may be private — a screen recording can show anything that was on the screen. Such a video goes to Google only with an explicit `--engine gemini`, which uploads the file to Google's Files API and deletes it after the answer. Never pass `--engine gemini` for a local file or a non-YouTube link unless the user asked for Gemini by name; when it would clearly help, offer it and say the video will be uploaded to Google.
+
+**How to treat a Gemini answer.** It is Gemini's description, not something you saw:
+- Say so when you relay it ("Gemini reports that at 12:34…"). Do not present it as your own viewing.
+- Its timestamps are claims. When a moment matters — the user will act on it, quote it, or cut video at it — check it with a focused local run: `--engine local --start <T-5s> --end <T+5s>`.
+- Names and figures in it carry the same caveat as a transcript's (see Step 4).
+
+**When to use the local engine instead:** the user needs you to inspect the picture yourself — recreating a layout or animation, comparing exact colours or positions, reading code off the screen character by character — or the video is a local file or non-YouTube link and they have not asked for Gemini.
+
+**`--start`/`--end` on Gemini** switch it from agentic search to a fixed clip of that window (the API only accepts a range that way); the Engine line says "static clip".
+
+**If Gemini fails** the report says why (bad key, quota used up, video refused, network) and nothing else is attempted — no automatic switch to the local engine, because for YouTube that would start the very download the Gemini path avoids. Relay the reason, then offer `--engine local`. A quota failure means the free daily allowance is used up; it resets on its own and never starts charging.
+
+**Setting it up.** The key comes from Google AI Studio (aistudio.google.com → Get API key → Create API key), on a project with billing left off so it stays on the free tier. Ask the user to paste it into `~/.config/watch/.env` themselves as `GEMINI_API_KEY=...` — offer to open that file for them (`open -e ~/.config/watch/.env` on macOS) rather than asking for the key in chat. `WATCH_ENGINE=local` in the same file turns Gemini off without removing the key; `WATCH_GEMINI_MODEL` changes the model (default `gemini-3.7-flash`).
 
 ### Screen recordings (automatic, but say so in your answer)
 
@@ -329,13 +354,14 @@ If you already watched a video this session and the user asks a follow-up, do **
 - Sends the extracted audio clip to Groq's Whisper API (`api.groq.com/openai/v1/audio/transcriptions`) when `GROQ_API_KEY` is set (preferred — cheaper, faster)
 - Sends the extracted audio clip to OpenAI's audio transcription API (`api.openai.com/v1/audio/transcriptions`) when `OPENAI_API_KEY` is set and Groq is not, or when `--whisper openai` is forced
 - Writes the downloaded video, frames, audio, and an intermediate transcript to a working directory under the system temp dir (or `--out-dir` if specified) so Claude can `Read` them
-- Reads / creates `~/.config/watch/.env` (mode `0600`) to store the Whisper API key(s) and a `SETUP_COMPLETE` marker. As a fallback, also reads `.env` in the current working directory
+- On a Gemini run (see "Engines"): sends the YouTube link and the user's question to Google's Gemini API (`generativelanguage.googleapis.com`). For anything other than a YouTube link, only on an explicit `--engine gemini`: uploads the video file to Google's Files API and deletes it after the answer (Google also expires it within 48 hours if the delete fails)
+- Reads / creates `~/.config/watch/.env` (mode `0600`) to store the Whisper and Gemini API key(s) and a `SETUP_COMPLETE` marker. As a fallback, also reads `.env` in the current working directory
 - **Two small diagnostic requests, both anonymous, both only when something has already gone wrong.** Neither sends anything about the user: (a) preflight asks `pypi.org` for yt-dlp's current version number, but only when the installed copy is already past the staleness threshold, and caches the answer for a day; (b) on a refused download of a YouTube URL, the failure path asks `youtube.com/oembed` for that video's title — the same public host the URL already points at — to tell "blocked" apart from "gone". Both fail open: if they cannot be reached, the diagnosis degrades to saying so
 
 **What this skill does NOT do:**
-- Does not upload the video itself to any API — only the extracted audio goes out, and only when native captions are missing AND Whisper is not disabled with `--no-whisper`
+- Does not upload a video file anywhere unless `--engine gemini` was passed explicitly. On the local engine only the extracted audio goes out, and only when native captions are missing AND Whisper is not disabled with `--no-whisper`
 - Does not access any platform account (no login, no session cookies, no posting) — yt-dlp only ever requests public data. It never passes `--cookies-from-browser`, never reads a browser profile, and never triggers a keychain prompt. If a refused download tempts you to suggest cookies, read "Cookies: never suggest `--cookies-from-browser` without saying what it costs" first
-- Does not share API keys between providers (Groq key only goes to `api.groq.com`, OpenAI key only goes to `api.openai.com`)
+- Does not share API keys between providers (Groq key only goes to `api.groq.com`, OpenAI key only goes to `api.openai.com`, Gemini key only goes to `generativelanguage.googleapis.com`, in a header and never in a URL)
 - Does not log, cache, or write API keys to stdout, stderr, or output files
 - Does not persist anything outside the working directory and `~/.config/watch/.env` — clean up the working directory when you're done (Step 5)
 

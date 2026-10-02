@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -16,7 +17,8 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from config import QUALITIES, frame_cap, get_config  # noqa: E402
+import gemini  # noqa: E402
+from config import QUALITIES, frame_cap, get_config, load_gemini_key, resolve_engine  # noqa: E402
 from download import download, fetch_captions, is_url  # noqa: E402
 from frames import DEFAULT_RESOLUTION, MAX_FPS, SCREEN_FRAME_CAP, SCREEN_RESOLUTION, auto_fps, auto_fps_focus, detect_screen_recording, extract_at_timestamps, extract_keyframes, extract_scene_or_uniform, format_time, get_metadata, merge_frames, parse_time, parse_timestamps  # noqa: E402
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
@@ -99,6 +101,92 @@ def write_manifest(
     return path
 
 
+# Options that shape frames and transcripts. Gemini does its own watching, so on
+# a Gemini run these do nothing — the report lists any that were passed rather
+# than silently dropping them.
+LOCAL_ONLY_OPTIONS = (
+    ("--max-frames", "max_frames"), ("--resolution", "resolution"), ("--fps", "fps"),
+    ("--detail", "detail"), ("--timestamps", "timestamps"), ("--whisper", "whisper"),
+)
+
+
+def run_gemini(args, config: dict, key: str, start_sec, end_sec) -> int:
+    """Google watches the video and answers. No frames, no transcript, no fallback.
+
+    No silent switch to the local engine on failure: for YouTube that would
+    start the very download Gemini exists to avoid, and the user should know
+    which engine produced what they are reading.
+    """
+    ignored = [flag for flag, name in LOCAL_ONLY_OPTIONS if getattr(args, name) is not None]
+    ignored += [flag for flag, on in (("--no-whisper", args.no_whisper),
+                                      ("--no-dedup", args.no_dedup)) if on]
+    uri = gemini.youtube_uri(args.source)
+    result = None
+    error = None
+    warning = None
+    uploaded = None
+    work = None
+    sent = "YouTube link only — nothing downloaded or uploaded"
+    try:
+        if uri:
+            video = {"uri": uri}
+        else:
+            if is_url(args.source):
+                work = Path(tempfile.mkdtemp(prefix="watch-gemini-"))
+                print("[watch] downloading video via yt-dlp to upload it…", file=sys.stderr)
+                media = download(args.source, work / "download",
+                                 quality=args.quality or str(config["quality"]))
+            else:
+                media = download(args.source, Path("."))
+            print("[watch] uploading the video to Google…", file=sys.stderr)
+            uploaded = gemini.upload_file(Path(media["video_path"]), key)
+            video = {"uri": uploaded["uri"], "mime_type": uploaded["mime_type"]}
+            sent = "the video file was uploaded to Google, and deleted after the answer"
+        print(f"[watch] asking {config['gemini_model']}…", file=sys.stderr)
+        result = gemini.ask(video, args.question, model=str(config["gemini_model"]), key=key,
+                            start=start_sec, end=end_sec,
+                            timeout=float(config["gemini_timeout"]))
+    except gemini.GeminiError as exc:
+        error = str(exc)
+    finally:
+        if uploaded:
+            warning = gemini.delete_file(uploaded["name"], key)
+        if work:  # Holds only the downloaded copy made for the upload.
+            shutil.rmtree(work, ignore_errors=True)
+
+    print("# watch: video report")
+    print()
+    print(f"- **Source:** {args.source}")
+    status = result["processing"] if result else "failed"
+    print(f"- **Engine:** Gemini — {config['gemini_model']} ({status})")
+    print(f"- **Sent to Google:** {sent}")
+    if start_sec is not None or end_sec is not None:
+        tail = format_time(end_sec) if end_sec is not None else "end"
+        print(f"- **Focus range:** {format_time(start_sec or 0)} → {tail}")
+    if ignored:
+        print(f"- **Ignored options:** {', '.join(ignored)} (these only apply with --engine local)")
+    if result and result["total_tokens"] is not None:
+        print(f"- **Gemini tokens:** {result['total_tokens']} (Google's allowance, not yours)")
+    if warning:
+        print(f"- **Cleanup warning:** {warning}")
+    print()
+    if error:
+        print(f"[watch] {error}", file=sys.stderr)
+        print("## Gemini failed")
+        print()
+        print(error)
+        print()
+        print("No local fallback was attempted. Rerun with `--engine local` for frames + transcript.")
+        return 1
+    print("## Answer (from Gemini)")
+    print()
+    print("_These are Gemini's observations of the video, not frames you viewed yourself. "
+          "Relay them as Gemini's; rerun with `--engine local` to inspect frames directly._")
+    print()
+    print(result["text"])
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         prog="watch",
@@ -158,9 +246,37 @@ def main() -> int:
         help="Disable near-duplicate frame removal. Keeps visually identical "
              "frames (static screen recordings, held slides) instead of collapsing them.",
     )
+    ap.add_argument(
+        "--engine",
+        choices=["auto", "gemini", "local"],
+        default=None,
+        help="gemini: Google's model watches the video and answers (needs GEMINI_API_KEY). "
+             "local: frames + transcript on this machine. auto (default): Gemini for "
+             "YouTube links when a key is set; everything else stays local.",
+    )
+    ap.add_argument(
+        "--question",
+        default=None,
+        help="The user's question, sent to Gemini on a Gemini run (unused by the local engine).",
+    )
     args = ap.parse_args()
 
     config = get_config()
+    gemini_key = load_gemini_key()
+    engine = resolve_engine(
+        args.engine or str(config["engine"]),
+        has_key=bool(gemini_key),
+        youtube=gemini.youtube_id(args.source) is not None,
+    )
+    if engine == "gemini":
+        g_start = parse_time(args.start)
+        g_end = parse_time(args.end)
+        if g_start is not None and g_start < 0:
+            raise SystemExit("--start must be non-negative")
+        if g_end is not None and g_start is not None and g_end <= g_start:
+            raise SystemExit("--end must be greater than --start")
+        return run_gemini(args, config, gemini_key, g_start, g_end)
+
     detail = args.detail or str(config["detail"])
     quality = args.quality or str(config["quality"])
     max_fps = float(config["max_fps"])

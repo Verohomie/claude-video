@@ -31,6 +31,16 @@ QUALITIES = {"360", "480", "720", "1080", "1440", "2160", "best"}
 #   WATCH_MAX_FPS=24 with --start/--end and --max-frames on a few seconds.
 DEFAULT_MAX_FPS = 2.0
 
+# Which engine watches the video. "local" is frames + transcript read by the
+# agent itself. "gemini" hands the video to Google's model and relays its
+# answer. "auto" uses Gemini only for YouTube links, and only when a key is set:
+# a YouTube video is already public, while a local file or another site's video
+# may be private — those leave the machine only on an explicit --engine gemini.
+DEFAULT_ENGINE = "auto"
+ENGINES = {"auto", "gemini", "local"}
+DEFAULT_GEMINI_MODEL = "gemini-3.7-flash"
+DEFAULT_GEMINI_TIMEOUT = 600.0
+
 
 def read_env_file(path: Path | None = None) -> dict[str, str]:
     if path is None:
@@ -100,12 +110,66 @@ def get_config() -> dict[str, object]:
     if not (math.isfinite(max_fps) and max_fps > 0):
         max_fps = DEFAULT_MAX_FPS
 
+    engine = str(
+        os.environ.get("WATCH_ENGINE")
+        or file_values.get("WATCH_ENGINE")
+        or DEFAULT_ENGINE
+    ).strip().lower()
+    if engine not in ENGINES:
+        engine = DEFAULT_ENGINE
+
+    gemini_model = (
+        os.environ.get("WATCH_GEMINI_MODEL")
+        or file_values.get("WATCH_GEMINI_MODEL")
+        or DEFAULT_GEMINI_MODEL
+    ).strip() or DEFAULT_GEMINI_MODEL
+
+    try:
+        gemini_timeout = float(
+            os.environ.get("WATCH_GEMINI_TIMEOUT")
+            or file_values.get("WATCH_GEMINI_TIMEOUT")
+            or DEFAULT_GEMINI_TIMEOUT
+        )
+    except (TypeError, ValueError):
+        gemini_timeout = DEFAULT_GEMINI_TIMEOUT
+    if not (math.isfinite(gemini_timeout) and gemini_timeout > 0):
+        gemini_timeout = DEFAULT_GEMINI_TIMEOUT
+
     return {
         "detail": detail,
         "quality": quality,
         "max_fps": max_fps,
+        "engine": engine,
+        "gemini_model": gemini_model,
+        "gemini_timeout": gemini_timeout,
         "config_file": str(CONFIG_FILE),
     }
+
+
+def load_gemini_key() -> str | None:
+    """GEMINI_API_KEY from the environment, else the config file; None if unset."""
+    key = os.environ.get("GEMINI_API_KEY") or read_env_file().get("GEMINI_API_KEY")
+    key = (key or "").strip()
+    return key or None
+
+
+def resolve_engine(requested: str, *, has_key: bool, youtube: bool) -> str:
+    """Decide which engine runs: "gemini" or "local".
+
+    An explicit "gemini" without a key is an error, not a quiet switch to local:
+    the user asked for something specific and should hear why it can't happen.
+    """
+    if requested == "local":
+        return "local"
+    if requested == "gemini":
+        if not has_key:
+            raise SystemExit(
+                "--engine gemini needs GEMINI_API_KEY in ~/.config/watch/.env "
+                "(create one at https://aistudio.google.com/apikey), "
+                "or rerun with --engine local."
+            )
+        return "gemini"
+    return "gemini" if (has_key and youtube) else "local"
 
 
 def frame_cap(detail: str) -> int | None:

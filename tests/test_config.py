@@ -26,7 +26,8 @@ def test_get_config_keys(monkeypatch, tmp_path):
     monkeypatch.delenv("WATCH_DETAIL", raising=False)
     monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "missing.env")
     cfg = config.get_config()
-    assert set(cfg) == {"detail", "quality", "max_fps", "config_file"}
+    assert set(cfg) == {"detail", "quality", "max_fps", "engine", "gemini_model",
+                        "gemini_timeout", "config_file"}
 
 
 # --- WATCH_MAX_FPS ----------------------------------------------------------
