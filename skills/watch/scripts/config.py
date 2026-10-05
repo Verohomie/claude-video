@@ -40,6 +40,9 @@ DEFAULT_ENGINE = "auto"
 ENGINES = {"auto", "gemini", "local"}
 DEFAULT_GEMINI_MODEL = "gemini-3.7-flash"
 DEFAULT_GEMINI_TIMEOUT = 600.0
+# Gemini runs longer than this many minutes of video are priced and held for
+# the user's go-ahead (--confirm-cost) instead of being sent straight away.
+DEFAULT_GEMINI_CONFIRM_MINUTES = 30.0
 
 
 def read_env_file(path: Path | None = None) -> dict[str, str]:
@@ -135,6 +138,17 @@ def get_config() -> dict[str, object]:
     if not (math.isfinite(gemini_timeout) and gemini_timeout > 0):
         gemini_timeout = DEFAULT_GEMINI_TIMEOUT
 
+    try:
+        confirm_minutes = float(
+            os.environ.get("WATCH_GEMINI_CONFIRM_MINUTES")
+            or file_values.get("WATCH_GEMINI_CONFIRM_MINUTES")
+            or DEFAULT_GEMINI_CONFIRM_MINUTES
+        )
+    except (TypeError, ValueError):
+        confirm_minutes = DEFAULT_GEMINI_CONFIRM_MINUTES
+    if not (math.isfinite(confirm_minutes) and confirm_minutes >= 0):
+        confirm_minutes = DEFAULT_GEMINI_CONFIRM_MINUTES
+
     return {
         "detail": detail,
         "quality": quality,
@@ -142,6 +156,7 @@ def get_config() -> dict[str, object]:
         "engine": engine,
         "gemini_model": gemini_model,
         "gemini_timeout": gemini_timeout,
+        "gemini_confirm_minutes": confirm_minutes,
         "config_file": str(CONFIG_FILE),
     }
 

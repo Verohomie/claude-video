@@ -267,12 +267,20 @@ def _args(**over):
     import argparse
     base = dict(source="https://youtu.be/qSuCPooR3E4", question="what tool is shown?",
                 max_frames=None, resolution=None, fps=None, detail=None, timestamps=None,
-                whisper=None, no_whisper=False, no_dedup=False, quality=None)
+                whisper=None, no_whisper=False, no_dedup=False, quality=None,
+                confirm_cost=False)
     base.update(over)
     return argparse.Namespace(**base)
 
 
 CFG = {"gemini_model": "gemini-3.7-flash", "gemini_timeout": 600.0, "quality": "1080"}
+
+
+@pytest.fixture(autouse=True)
+def no_metadata_lookups(monkeypatch):
+    """The cost check reads a video's length first; keep that off the network."""
+    import watch
+    monkeypatch.setattr(watch, "fetch_duration", lambda url: 510.0)
 
 
 def test_report_labels_the_answer_as_geminis(monkeypatch, capsys):
@@ -323,3 +331,73 @@ def test_an_explicit_local_file_is_uploaded_then_deleted(monkeypatch, capsys, tm
     assert watch.run_gemini(_args(source=str(clip)), CFG, KEY, None, None) == 0
     assert events == ["upload", "ask", "delete"]
     assert "uploaded to Google, and deleted" in capsys.readouterr().out
+
+
+# --- the cost check -----------------------------------------------------------
+
+
+def test_a_long_video_is_priced_and_held(monkeypatch, capsys):
+    import watch
+    monkeypatch.setattr(watch, "fetch_duration", lambda url: 3.5 * 3600)
+    monkeypatch.setattr(watch.gemini, "ask", lambda *a, **k: pytest.fail("must not be sent"))
+    assert watch.run_gemini(_args(), {**CFG, "gemini_confirm_minutes": 30.0}, KEY, None, None) == 2
+    out = capsys.readouterr().out
+    assert "Cost check — not sent yet" in out
+    assert "3:30:00" in out and "--confirm-cost" in out
+    assert "$" in out
+
+
+def test_confirm_cost_sends_it(monkeypatch, capsys):
+    import watch
+    monkeypatch.setattr(watch, "fetch_duration", lambda url: 3.5 * 3600)
+    monkeypatch.setattr(watch.gemini, "ask", lambda *a, **k: {
+        "text": "ok", "model": "m", "processing": "agentic, whole video", "total_tokens": 2_000_000})
+    assert watch.run_gemini(_args(confirm_cost=True), {**CFG, "gemini_confirm_minutes": 30.0},
+                            KEY, None, None) == 0
+    out = capsys.readouterr().out
+    assert "Estimated cost:" in out and "2,000,000" in out
+
+
+def test_a_short_range_of_a_long_video_goes_straight_through(monkeypatch, capsys):
+    """--start/--end price the clip, not the whole film, and need no lookup."""
+    import watch
+    monkeypatch.setattr(watch, "fetch_duration", lambda url: pytest.fail("range is already known"))
+    monkeypatch.setattr(watch.gemini, "ask", lambda *a, **k: {
+        "text": "ok", "model": "m", "processing": "static clip", "total_tokens": None})
+    assert watch.run_gemini(_args(), {**CFG, "gemini_confirm_minutes": 30.0}, KEY, 600.0, 900.0) == 0
+    assert "for 05:00 of video" in capsys.readouterr().out
+
+
+def test_an_unknown_length_is_sent_and_says_so(monkeypatch, capsys):
+    """Fail open: a metadata refusal must not block the engine built for refusals."""
+    import watch
+    monkeypatch.setattr(watch, "fetch_duration", lambda url: None)
+    monkeypatch.setattr(watch.gemini, "ask", lambda *a, **k: {
+        "text": "ok", "model": "m", "processing": "agentic, whole video", "total_tokens": 5000})
+    assert watch.run_gemini(_args(), CFG, KEY, None, None) == 0
+    assert "length could not be read" in capsys.readouterr().out
+
+
+def test_estimate_matches_the_measured_rate():
+    # 8.5 minutes measured at 113,794 tokens; the estimate should be in that region.
+    assert 100_000 < gemini.estimate_tokens(510) < 125_000
+
+
+def test_price_doubles_on_the_first_of_2027():
+    import datetime
+    assert gemini.price_per_million(datetime.date(2026, 12, 31)) == 0.75
+    assert gemini.price_per_million(datetime.date(2027, 1, 1)) == 1.50
+
+
+def test_money_reads_plainly():
+    assert gemini.dollars(0.085) == "8.5¢"
+    assert gemini.dollars(2.05) == "$2.05"
+    assert gemini.dollars(0.0) == "0.1¢"
+
+
+def test_confirm_minutes_setting(no_config_file, monkeypatch):
+    assert config.get_config()["gemini_confirm_minutes"] == 30.0
+    monkeypatch.setenv("WATCH_GEMINI_CONFIRM_MINUTES", "10")
+    assert config.get_config()["gemini_confirm_minutes"] == 10.0
+    monkeypatch.setenv("WATCH_GEMINI_CONFIRM_MINUTES", "nan")
+    assert config.get_config()["gemini_confirm_minutes"] == 30.0

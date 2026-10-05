@@ -26,9 +26,10 @@ INTERACTIONS = f"{API}/v1beta/interactions"
 
 _HINTS = {
     "auth": "check GEMINI_API_KEY (create one at https://aistudio.google.com/apikey)",
-    "quota": "the key is rate-limited or out of its free allowance; wait for it to reset",
+    "quota": "the key hit its rate limit; wait a minute and retry",
     "rejected": "Gemini refused this request; the video may be private, age-restricted, or too long",
-    "service": "Gemini had a server error; retry shortly",
+    "service": ("Gemini had a server error; retry shortly. If 'high demand' never clears, check "
+                "the key's project has billing on: free-tier keys are refused all video"),
     "network": "could not reach generativelanguage.googleapis.com; check the network or proxy",
     "response": "Gemini returned something this version cannot read",
     "upload": "the video could not be uploaded to or processed by Google",
@@ -46,6 +47,36 @@ PROMPT_SUFFIX = (
 )
 
 _YOUTUBE_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+# What a run costs, so a long video is never sent by accident. Measured, not
+# taken from Google's benchmark slide: that slide implied ~700 tokens per
+# minute of video, and the first real runs used ~12,000-13,400 (113,794 tokens
+# for an 8.5-minute interview, 3,917 for 19 seconds). Re-measure if the model
+# or Google's processing changes; the report prints the real count every run.
+TOKENS_PER_VIDEO_MINUTE = 13_000
+# Paid-tier price per million tokens (text, image, video and audio input are
+# priced alike). Google doubles it on 2027-01-01. Output is a few thousand
+# tokens at most, so input dominates and the estimate uses it alone.
+_PRICE_CHANGE = (2027, 1, 1)
+_PRICE_BEFORE, _PRICE_AFTER = 0.75, 1.50
+
+
+def price_per_million(today=None) -> float:
+    import datetime
+    today = today or datetime.date.today()
+    return _PRICE_AFTER if today >= datetime.date(*_PRICE_CHANGE) else _PRICE_BEFORE
+
+
+def estimate_tokens(seconds: float) -> int:
+    return int(round(seconds / 60.0 * TOKENS_PER_VIDEO_MINUTE))
+
+
+def cost_of(tokens: int, today=None) -> float:
+    return tokens / 1_000_000 * price_per_million(today)
+
+
+def dollars(amount: float) -> str:
+    return f"${amount:.2f}" if amount >= 0.995 else f"{max(amount * 100, 0.1):.1f}¢"
 
 
 def youtube_id(source: str) -> str | None:

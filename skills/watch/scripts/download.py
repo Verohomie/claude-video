@@ -121,6 +121,28 @@ def fetch_captions(url: str, out_dir: Path) -> dict:
     }
 
 
+def fetch_duration(url: str, timeout: float = 30.0) -> float | None:
+    """Length of a video in seconds, read from its metadata; None if unknown.
+
+    Metadata only -- nothing is downloaded. Used to price a Gemini run before
+    it is sent. Fails open: a metadata refusal must not block a Gemini run,
+    since Gemini exists precisely for the case where YouTube refuses us.
+    """
+    try:
+        proc = subprocess.run(
+            [resolve_ytdlp(), "--skip-download", "--no-playlist", "--no-warnings",
+             "--print", "duration", "--", url],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    try:
+        value = float(proc.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return None
+    return value if value > 0 else None
+
+
 def _read_info(info_path: Path, url: str) -> dict:
     info: dict = {}
     if info_path.exists():

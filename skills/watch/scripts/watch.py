@@ -19,7 +19,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 import gemini  # noqa: E402
 from config import QUALITIES, frame_cap, get_config, load_gemini_key, resolve_engine  # noqa: E402
-from download import download, fetch_captions, is_url  # noqa: E402
+from download import download, fetch_captions, fetch_duration, is_url  # noqa: E402
 from frames import DEFAULT_RESOLUTION, MAX_FPS, SCREEN_FRAME_CAP, SCREEN_RESOLUTION, auto_fps, auto_fps_focus, detect_screen_recording, extract_at_timestamps, extract_keyframes, extract_scene_or_uniform, format_time, get_metadata, merge_frames, parse_time, parse_timestamps  # noqa: E402
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 from whisper import assess_speech, load_api_key, transcribe_video  # noqa: E402
@@ -110,6 +110,47 @@ LOCAL_ONLY_OPTIONS = (
 )
 
 
+def gemini_span(source: str, start_sec, end_sec) -> float | None:
+    """Seconds of video a Gemini run would cover, or None if it can't be told.
+
+    Read from metadata only, before anything is sent, so the run can be priced.
+    """
+    if start_sec is not None and end_sec is not None:
+        return end_sec - start_sec
+    if is_url(source):
+        total = fetch_duration(source)
+    else:
+        try:
+            total = get_metadata(str(Path(source).expanduser().resolve()))["duration_seconds"] or None
+        except (SystemExit, Exception):
+            total = None
+    if total is None:
+        return None
+    end = min(end_sec, total) if end_sec is not None else total
+    return max(end - (start_sec or 0.0), 0.0)
+
+
+def print_cost_hold(args, config: dict, span: float) -> int:
+    """Price a long video and stop, so it is sent only on the user's say-so."""
+    tokens = gemini.estimate_tokens(span)
+    print("# watch: video report")
+    print()
+    print(f"- **Source:** {args.source}")
+    print(f"- **Engine:** Gemini — {config['gemini_model']} (not sent)")
+    print()
+    print("## Cost check — not sent yet")
+    print()
+    print(f"This covers {format_time(span)} of video. At about "
+          f"{gemini.TOKENS_PER_VIDEO_MINUTE:,} tokens per minute that is roughly "
+          f"{tokens:,} tokens, about **{gemini.dollars(gemini.cost_of(tokens))}** on the "
+          "Gemini key (paid by the user's Google account, not their Claude allowance).")
+    print()
+    print("Ask the user before spending it. Then either rerun the same command with "
+          "`--confirm-cost`, narrow it with `--start`/`--end` to the part that matters, "
+          "or use `--engine local`.")
+    return 2
+
+
 def run_gemini(args, config: dict, key: str, start_sec, end_sec) -> int:
     """Google watches the video and answers. No frames, no transcript, no fallback.
 
@@ -120,6 +161,10 @@ def run_gemini(args, config: dict, key: str, start_sec, end_sec) -> int:
     ignored = [flag for flag, name in LOCAL_ONLY_OPTIONS if getattr(args, name) is not None]
     ignored += [flag for flag, on in (("--no-whisper", args.no_whisper),
                                       ("--no-dedup", args.no_dedup)) if on]
+    span = gemini_span(args.source, start_sec, end_sec)
+    limit = float(config.get("gemini_confirm_minutes", 30.0)) * 60
+    if span is not None and span > limit and not args.confirm_cost:
+        return print_cost_hold(args, config, span)
     uri = gemini.youtube_uri(args.source)
     result = None
     error = None
@@ -165,8 +210,16 @@ def run_gemini(args, config: dict, key: str, start_sec, end_sec) -> int:
         print(f"- **Focus range:** {format_time(start_sec or 0)} → {tail}")
     if ignored:
         print(f"- **Ignored options:** {', '.join(ignored)} (these only apply with --engine local)")
+    if span is not None:
+        estimate = gemini.estimate_tokens(span)
+        print(f"- **Estimated cost:** about {gemini.dollars(gemini.cost_of(estimate))} "
+              f"for {format_time(span)} of video")
+    else:
+        print("- **Estimated cost:** unknown — the video's length could not be read beforehand")
     if result and result["total_tokens"] is not None:
-        print(f"- **Gemini tokens:** {result['total_tokens']} (Google's allowance, not yours)")
+        used = result["total_tokens"]
+        print(f"- **Gemini tokens:** {used:,} — about {gemini.dollars(gemini.cost_of(used))}, "
+              "billed to the Gemini key, not the Claude allowance")
     if warning:
         print(f"- **Cleanup warning:** {warning}")
     print()
@@ -253,6 +306,12 @@ def main() -> int:
         help="gemini: Google's model watches the video and answers (needs GEMINI_API_KEY). "
              "local: frames + transcript on this machine. auto (default): Gemini for "
              "YouTube links when a key is set; everything else stays local.",
+    )
+    ap.add_argument(
+        "--confirm-cost",
+        action="store_true",
+        help="Send a Gemini run that is longer than WATCH_GEMINI_CONFIRM_MINUTES "
+             "(default 30). Without it such a run is priced and held for the user's go-ahead.",
     )
     ap.add_argument(
         "--question",
