@@ -79,6 +79,7 @@ rsync -a ${DRY_RUN[@]+"${DRY_RUN[@]}"} \
   --exclude '.in_use/' \
   --exclude 'tests/' \
   --exclude 'docs/' \
+  --exclude '.notes/' \
   --exclude 'dist/' \
   --exclude 'V2_*.md' \
   --exclude 'dev-sync.sh' \
